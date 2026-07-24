@@ -334,7 +334,11 @@ class DefaultEplb(EplbPolicy):
         # Obtain the priority of each layer
         layer_changed_ratio = []
         for layer_idx in range(layer_num):
-            layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / max_heat_per_layer_before[layer_idx])
+            heat_before = max_heat_per_layer_before[layer_idx]
+            if heat_before == 0:
+                layer_changed_ratio.append(1.0)
+            else:
+                layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / heat_before)
 
         per_layer_priority = np.argsort(layer_changed_ratio)
         npu_heat_all_after = sum(max_heat_per_layer_after)

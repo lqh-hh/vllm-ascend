@@ -100,6 +100,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # Whether to use MoeDistribute V3 low latency dispatch/combine in the MC2
+    # MoE communication path. 0: disabled; 1: enabled for validation.
+    "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0"))),
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),

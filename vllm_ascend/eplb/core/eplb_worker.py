@@ -19,11 +19,10 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.distributed as dist
-from vllm.distributed import get_ep_group
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 from vllm_ascend.eplb.core.policy.policy_factory import PolicyFactory
 
@@ -37,18 +36,18 @@ class EplbWorker:
         tp_size: int | None = None,
     ):
         self.policy_type = policy_type
+        self.default_policy_type = policy_type
         self.policy = PolicyFactory.generate_policy(policy_type)
         self.shared_dict = shared_dict
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
         self.tp_size = tp_size
-        self.rank_id = get_ep_group().rank_in_group
+        dynamic_eplb_group = get_dynamic_eplb_group()
+        self.rank_id = dynamic_eplb_group.rank_in_group
+        self.rank_id_to_initial_global = list(range(dynamic_eplb_group.world_size))
+        n_ranks_per_node = torch.npu.device_count() if hasattr(torch, "npu") else 8
+        self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(dynamic_eplb_group.world_size)]
         self.multi_stage = policy_type == 3
-
-        n_total_ranks = dist.get_world_size()
-        n_ranks_per_node = torch.npu.device_count()
-        self.rank_id_to_initial_global = list(range(n_total_ranks))
-        self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(n_total_ranks)]
         self.enable_dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
         self.old_load_info = None
 
@@ -62,6 +61,25 @@ class EplbWorker:
         # H2D
         # Get initial expert_map
         torch.set_num_threads(1)
+        if self.shared_dict.get("reset_old_expert_maps", False):
+            self.old_expert_maps = self.get_init_expert_maps()
+            if self.old_expert_maps is not None:
+                self.num_local_experts = self.old_expert_maps.max() + 1
+            else:
+                raise ValueError("Failed to reset expert_maps from shared_dict.")
+            world_size = self.shared_dict.get("new_ep_size")
+            if world_size is None:
+                world_size = self.old_expert_maps.shape[1]
+            self.rank_id_to_initial_global = list(range(world_size))
+            n_ranks_per_node = torch.npu.device_count() if hasattr(torch, "npu") else 8
+            self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(world_size)]
+            self.shared_dict["reset_old_expert_maps"] = False
+            logger.info(
+                "[EPLB] reset cached old expert maps: rank=%s, world_size=%s, shape=%s",
+                self.rank_id,
+                world_size,
+                tuple(self.old_expert_maps.shape),
+            )
         if self.old_expert_maps is None:
             self.old_expert_maps = self.get_init_expert_maps()
             if self.old_expert_maps is not None:
@@ -73,19 +91,39 @@ class EplbWorker:
 
         # Get MOE load information
         load_info = self.fetch_and_sum_load_info()
-        if load_info is None and not self.shared_dict["scale_down"]:
+        scale_down = self.shared_dict.get("scale_down", False)
+        if load_info is None and not scale_down:
             logger.debug("[eplb/worker] No moe_load data available yet, skipping this cycle")
             return
 
+        scale = self.shared_dict.get("scale", False)
+        if scale:
+            old_ep_size = self.shared_dict["old_ep_size"]
+            new_ep_size = self.shared_dict["new_ep_size"]
+            assert old_ep_size != new_ep_size
+            self.policy.set_new_ep_size(new_ep_size)
+            if new_ep_size > old_ep_size:
+                self._restore_rank_id_for_scale_up(old_ep_size, new_ep_size)
+            if load_info is not None and load_info.shape[1] > old_ep_size:
+                load_info = load_info[:, :old_ep_size]
+            if self.old_expert_maps.shape[1] > old_ep_size:
+                self.old_expert_maps = self.old_expert_maps[:, :old_ep_size]
+
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
-        if self.shared_dict["scale_down"]:
+        num_add_experts_per_rank = 0
+        if scale_down:
             exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
             enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
-            update_layer_id = self.shared_dict["update_layer_id"]
+            update_layer_id = self.shared_dict.get("update_layer_id", -1)
             self.update_rank_id(exclude_dp_ranks)
+            effective_load_info = load_info if load_info is not None else self.old_load_info
             new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
-                old_placement, exclude_dp_ranks, enable_d2d_after_failure, update_layer_id
+                effective_load_info,
+                old_placement,
+                exclude_dp_ranks,
+                enable_d2d_after_failure,
+                update_layer_id,
             )
             if not torch.is_tensor(old_deployment):
                 old_placement = torch.tensor(old_deployment)
@@ -93,32 +131,80 @@ class EplbWorker:
             self.shared_dict["need_load_h2d"] = need_load_h2d
             self.shared_dict["num_add_experts_per_rank"] = num_add_experts_per_rank
         else:
-            num_add_experts_per_rank = 0
             _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-            self.old_load_info = self.get_original_workload(load_info)
+            if load_info is not None:
+                self.old_load_info = load_info
+
+        if self.rank_id == 0 and load_info is not None and not scale_down:
+            if self.multi_stage:
+                hotness = self._calculate_hotness(old_placement, load_info.sum(0))
+            else:
+                hotness = self._calculate_hotness(old_placement, load_info)
+            # ms-service-metric begin: expose EPLB hotness details for metrics collection.
+            current_mean, current_max, current_imbalance_list = self._compute_imbalance(
+                old_placement, hotness, return_list=True
+            )
+            update_mean, update_max, update_imbalance_list = self._compute_imbalance(
+                new_placement, hotness, return_list=True
+            )
+            self.latest_expert_hotness = {
+                "current_mean": current_mean,
+                "current_max": current_max,
+                "update_mean": update_mean,
+                "update_max": update_max,
+                "current_imbalance_list": current_imbalance_list,
+                "update_imbalance_list": update_imbalance_list,
+            }
+            # ms-service-metric end.
+            logger.info(
+                "[Expert Hotness] Current: mean=%.3f, max=%.3f, Updated: mean=%.3f, max=%.3f",
+                current_mean,
+                current_max,
+                update_mean,
+                update_max,
+            )
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
-        self.check_expert_placement(old_placement, new_placement)
+        if not scale and not scale_down:
+            self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
+        new_expert_maps_clone = new_expert_maps.clone()
 
-        if self.shared_dict["scale_down"] and self.shared_dict["enable_d2d_after_failure"]:
+        if scale_down and self.shared_dict["enable_d2d_after_failure"]:
             self.update_expert_map(self.old_expert_maps.clone())
         else:
             self.update_expert_map(new_expert_maps)
 
+        if scale:
+            shape = list(new_expert_maps.shape)
+            shape[1] = abs(old_ep_size - new_ep_size)
+            if old_ep_size > new_ep_size:
+                shutdown_rank_expert_maps = torch.full(shape, -1, dtype=new_expert_maps.dtype)
+                new_expert_maps = torch.cat([new_expert_maps, shutdown_rank_expert_maps], dim=1)
+            else:
+                new_rank_expert_maps = torch.full(shape, -1, dtype=new_expert_maps.dtype)
+                self.old_expert_maps = torch.cat([self.old_expert_maps, new_rank_expert_maps], dim=1)
+
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
-        self.old_expert_maps = new_expert_maps
+        self.old_expert_maps = new_expert_maps_clone
         logger.debug("[eplb/worker] EPLB Process compute complete")
 
-        if self.shared_dict["scale_down"] and not self.shared_dict["enable_d2d_after_failure"]:
+        if scale_down and not self.shared_dict["enable_d2d_after_failure"]:
             packed_update_info = []
         else:
             packed_update_info = self.pack_update_info(update_info)
-        self.shared_dict["scale_down"] = False
 
         if num_add_experts_per_rank > 0:
             self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))
+        if scale:
+            self.shared_dict["scale"] = False
+            self.shared_dict["old_ep_size"] = None
+            self.shared_dict["new_ep_size"] = None
+        self.shared_dict["scale_down"] = False
+        if scale_down and self.policy_type != self.default_policy_type:
+            self.policy_type = self.default_policy_type
+            self.policy = PolicyFactory.generate_policy(self.default_policy_type)
 
         return packed_update_info
 
@@ -230,6 +316,51 @@ class EplbWorker:
         changed, priority, new_map = self.policy.rebalance_experts(old_placement, load_info)
         return changed, priority, new_map
 
+    def trigger_fault_redeployment(
+        self,
+        load_info,
+        old_placement,
+        exclude_dp_ranks,
+        enable_d2d_after_failure,
+        update_layer_id=-1,
+    ):
+        if self.policy_type != 4:
+            self.policy = PolicyFactory.generate_policy(4)
+            self.policy_type = 4
+
+        self.policy.failed_cards = exclude_dp_ranks
+        self.policy.rank_id_to_node_id = self.rank_id_to_node_id
+        self.policy.enable_d2d_after_failure = enable_d2d_after_failure
+        self.policy.update_layer_id = update_layer_id
+        new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = self.policy.rebalance_experts(
+            old_placement, load_info
+        )
+        return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
+
+    def update_rank_id(self, exclude_dp_ranks):
+        unique_fault_ids = sorted(set(exclude_dp_ranks))
+        fault_count = 0
+        for failed_rank in unique_fault_ids:
+            if failed_rank <= self.rank_id:
+                fault_count += 1
+            else:
+                break
+        self.rank_id -= fault_count
+        for failed_rank in reversed(unique_fault_ids):
+            self.rank_id_to_initial_global.pop(failed_rank)
+            self.rank_id_to_node_id.pop(failed_rank)
+
+    def _restore_rank_id_for_scale_up(self, old_ep_size: int, new_ep_size: int):
+        if len(self.rank_id_to_initial_global) >= new_ep_size:
+            return
+
+        n_ranks_per_node = torch.npu.device_count() if hasattr(torch, "npu") else 8
+        for rank_id in range(old_ep_size, new_ep_size):
+            if rank_id in self.rank_id_to_initial_global:
+                continue
+            self.rank_id_to_initial_global.append(rank_id)
+            self.rank_id_to_node_id.append(rank_id // n_ranks_per_node)
+
     def get_init_expert_maps(self):
         """
         Read the initial expert_map from shared_dict.
@@ -310,19 +441,6 @@ class EplbWorker:
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
-    def trigger_fault_redeployment(self, old_placement, exclude_dp_ranks, enable_d2d_after_failure, update_layer_id):
-        policy = PolicyFactory.generate_policy(4)
-        policy.failed_cards = exclude_dp_ranks
-        policy.enable_d2d_after_failure = enable_d2d_after_failure
-        policy.rank_id_to_node_id = self.rank_id_to_node_id
-        policy.update_layer_id = update_layer_id
-
-        new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(
-            old_placement, self.old_load_info
-        )
-
-        return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
-
     def get_original_workload(self, load_info) -> np.ndarray:
         n_layer, n_rank, n_experts_per_card = load_info.shape
         workload_new = np.zeros((n_layer, self.num_local_experts))
@@ -336,22 +454,10 @@ class EplbWorker:
 
         return workload_new
 
-    def update_rank_id(self, exclude_dp_ranks: list[int]):
-        unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
-        fault_count = 0
-        for fault_id in unique_fault_ids:
-            if fault_id <= self.rank_id:
-                fault_count += 1
-            else:
-                break
-        self.rank_id = self.rank_id - fault_count
-        for i in reversed(unique_fault_ids):
-            self.rank_id_to_initial_global.pop(i)
-            self.rank_id_to_node_id.pop(i)
-
     def warm_up_shared_dict(self):
         old_expert_maps = self.get_init_expert_maps()
-        _ = old_expert_maps.max()
+        if old_expert_maps is not None:
+            _ = old_expert_maps.max()
 
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):
@@ -363,7 +469,8 @@ class EplbWorker:
             unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)
 
             stage_load = unit_hotness[deployment].sum(-1)
-            stage_par = stage_load.max() / stage_load.mean()
+            stage_mean = stage_load.mean()
+            stage_par = stage_load.max() / stage_mean if stage_mean != 0 else 1.0
             imbalance_list.append(stage_par)
 
         max_val = max(imbalance_list)
@@ -415,9 +522,6 @@ class EplbProcess:
             self.enable_d2d,
             tp_size=tp_size,
         )
-
-        warm_maps = torch.zeros((1, 1, 1), dtype=torch.int32)
-        self.shared_dict["expert_maps"] = warm_maps
 
     def worker_process(self, planner_q, block_update_q):
         """

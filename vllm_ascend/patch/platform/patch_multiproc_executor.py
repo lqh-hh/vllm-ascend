@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable
 from multiprocessing.synchronize import Lock as LockType
 
+import torch
 import vllm.v1.executor.multiproc_executor
 from vllm import envs
 from vllm.config import VllmConfig
@@ -63,6 +64,10 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
+        self.elastic_ep_dp_collective_states = [
+            torch.full((2,), -1, dtype=torch.int64).share_memory_()
+            for _ in range(self.local_world_size)
+        ]
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
@@ -83,6 +88,9 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                     distributed_init_method=distributed_init_method,
                     input_shm_handle=scheduler_output_handle,
                     shared_worker_lock=shared_worker_lock,
+                    elastic_ep_dp_collective_state=(
+                        self.elastic_ep_dp_collective_states[local_rank]
+                    ),
                     is_driver_worker=is_driver_worker,
                     inherited_fds=inherited_fds,
                 )
@@ -168,6 +176,7 @@ class AscendWorkerProc(WorkerProc):
         distributed_init_method: str,
         input_shm_handle,  # Receive SchedulerOutput
         shared_worker_lock: LockType,
+        elastic_ep_dp_collective_state: torch.Tensor,
         is_driver_worker: bool = False,
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
@@ -188,6 +197,7 @@ class AscendWorkerProc(WorkerProc):
             "ready_pipe": ready_writer,
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
+            "elastic_ep_dp_collective_state": elastic_ep_dp_collective_state,
             "is_driver_worker": is_driver_worker,
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],

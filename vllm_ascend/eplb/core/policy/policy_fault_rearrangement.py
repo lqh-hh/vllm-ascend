@@ -39,6 +39,22 @@ class FaultRearrangement(EplbPolicy):
         self.rank_id_to_node_id = None
         self.update_layer_id = -1
 
+    def get_original_workload(self) -> np.ndarray:
+        workload_new = np.zeros((self.n_layer, self.n_experts))
+        if self.enable_d2d_after_failure:
+            for layer_idx in range(self.n_layer):
+                workload_dict: dict[int, int] = defaultdict(int)
+                placement_layer = self.org_deployment[layer_idx].copy()
+                workload_layer = self.org_workload[layer_idx].copy()
+                for card_idx in range(self.n_org_cards):
+                    for index in range(self.n_experts_per_card):
+                        expert_id = int(placement_layer[card_idx][index])
+                        workload_dict[expert_id] += workload_layer[card_idx][index]
+                for expert_idx in range(self.n_experts):
+                    workload_new[layer_idx][expert_idx] = workload_dict[expert_idx]
+
+        return workload_new
+
     def constraint_expert_local_exchange(
         self, old_deployment: np.ndarray, new_deployment: np.ndarray
     ) -> tuple[list[list[int]], list[list[int]]]:
@@ -77,8 +93,11 @@ class FaultRearrangement(EplbPolicy):
         return new_deployment_list, old_deployment_list
 
     def rebalance_experts(
-        self, current_expert_table: torch.Tensor, expert_workload: np.ndarray
+        self, current_expert_table: torch.Tensor, expert_workload: torch.Tensor
     ) -> tuple[list[list[list[int]]], list[list[list[int]]], list[defaultdict[int, list[tuple[int, int]]]], int]:
+        if expert_workload is not None:
+            self.org_workload = expert_workload.numpy()
+
         self.org_deployment = current_expert_table.numpy()
 
         self.n_layer, self.n_org_cards, self.n_experts_per_card = self.org_deployment.shape
@@ -89,10 +108,7 @@ class FaultRearrangement(EplbPolicy):
         self.remain_deployment = self.org_deployment[:, mask, :]
         self.n_remain_cards = self.remain_deployment.shape[1]
 
-        if expert_workload is not None:
-            layer_workload = expert_workload.copy()
-        else:
-            layer_workload = np.zeros((self.n_layer, self.n_experts))
+        layer_workload = self.get_original_workload()
 
         if self.n_remain_cards == 0:
             raise ValueError("All cards are faulty, no available cards.")

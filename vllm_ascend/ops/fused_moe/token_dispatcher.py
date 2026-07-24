@@ -20,17 +20,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import weakref
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Generic
 
 import torch
+import torch.distributed as dist
 import torch_npu
-from vllm.config import get_current_vllm_config
+from torch.distributed.distributed_c10d import _world
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.distributed.parallel_state import get_elastic_info, get_mc2_group
+from vllm_ascend.distributed.elastic_ep.v3_capture_dp_sync import (
+    capture_dp_sync_group,
+)
+from vllm_ascend.distributed.parallel_state import (
+    get_elastic_info,
+    get_mc2_group,
+    set_elastic_info,
+)
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -98,6 +111,330 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
         raise NotImplementedError("Combine function not implemented.")
 
 
+class _MoeDistributeV3Adapter:
+    """Adapter for MoeDistribute V3 low latency dispatch/combine."""
+
+    _COMM_ALG = ""
+    _INSTANCES: "weakref.WeakSet[_MoeDistributeV3Adapter]" = weakref.WeakSet()
+
+    def __init__(self, max_tokens_per_rank: int) -> None:
+        self.max_tokens_per_rank = max_tokens_per_rank
+        self._buffer = None
+        self._buffer_key = None
+        self._ccl_buffer_size = None
+        self._elastic_info_signature = None
+        self._INSTANCES.add(self)
+
+    @staticmethod
+    def _current_elastic_info_signature():
+        elastic_info = get_elastic_info()
+        if elastic_info is None:
+            return None
+        try:
+            return tuple(int(x) for x in elastic_info.detach().cpu().tolist())
+        except RuntimeError:
+            return "<unavailable>"
+
+    @staticmethod
+    @contextmanager
+    def _use_stateless_group_rank(device_group, rank: int, world_size: int):
+        try:
+            default_rank = dist.get_rank()
+        except Exception:
+            yield
+            return
+
+        had_old_group_ranks = device_group in _world.pg_group_ranks
+        old_group_ranks = _world.pg_group_ranks.get(device_group)
+        try:
+            group_ranks = {i: i for i in range(world_size)}
+            group_ranks[default_rank] = int(rank)
+            _world.pg_group_ranks[device_group] = group_ranks
+            yield
+        finally:
+            if had_old_group_ranks:
+                _world.pg_group_ranks[device_group] = old_group_ranks
+            else:
+                _world.pg_group_ranks.pop(device_group, None)
+
+    def _ensure_buffer(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        moe_expert_num: int,
+    ):
+        from npu_ops_transformer.ops import MoeDistributeBuffer
+
+        mc2_group = get_mc2_group()
+        device_group = mc2_group.device_group
+        ep_world_size = mc2_group.world_size
+        hidden_size = hidden_states.shape[-1]
+        topk = topk_ids.shape[-1]
+        buffer_key = (
+            id(device_group),
+            ep_world_size,
+            self.max_tokens_per_rank,
+            hidden_size,
+            moe_expert_num,
+            topk,
+            self._COMM_ALG,
+        )
+        if self._buffer is not None and self._buffer_key == buffer_key:
+            return self._buffer
+
+        ccl_buffer_size = MoeDistributeBuffer.get_low_latency_ccl_buffer_size(
+            ep_world_size,
+            self.max_tokens_per_rank,
+            hidden_size,
+            moe_expert_num,
+            topk,
+            comm_alg=self._COMM_ALG,
+        )
+        with self._use_stateless_group_rank(device_group, mc2_group.rank_in_group, ep_world_size):
+            self._buffer = MoeDistributeBuffer(
+                device_group,
+                ccl_buffer_size=ccl_buffer_size,
+                comm_alg=0,
+            )
+        self._buffer_key = buffer_key
+        self._ccl_buffer_size = ccl_buffer_size
+        self._elastic_info_signature = self._current_elastic_info_signature()
+        return self._buffer
+
+    def ensure_buffer_for_shape(
+        self,
+        hidden_size: int,
+        topk: int,
+        moe_expert_num: int,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> bool:
+        hidden_states = torch.empty((1, hidden_size), dtype=dtype, device=device)
+        topk_ids = torch.empty((1, topk), dtype=torch.int32, device=device)
+        self._ensure_buffer(hidden_states, topk_ids, moe_expert_num)
+        return True
+
+    def update_ctx_to_mc2_group(self, mc2_group=None) -> bool:
+        if self._buffer is None or self._buffer_key is None:
+            return False
+
+        mc2_group = mc2_group or get_mc2_group()
+        device_group = mc2_group.device_group
+        ep_world_size = mc2_group.world_size
+        old_key = self._buffer_key
+        if old_key[1] != ep_world_size:
+            raise RuntimeError(
+                "MoeDistribute V3 update_ctx only supports switching to a group "
+                f"with the captured EP size, but got old_ep_size={old_key[1]}, "
+                f"new_ep_size={ep_world_size}."
+            )
+        elastic_info_signature = self._current_elastic_info_signature()
+        if old_key[0] == id(device_group) and self._elastic_info_signature == elastic_info_signature:
+            return False
+
+        if self._ccl_buffer_size is not None:
+            self._buffer.ccl_buffer_size.value = self._ccl_buffer_size
+        with (
+            self._use_stateless_group_rank(device_group, mc2_group.rank_in_group, ep_world_size),
+            torch.inference_mode(),
+        ):
+            self._buffer.update_ctx(device_group)
+        self._buffer_key = (id(device_group), *old_key[1:])
+        self._elastic_info_signature = elastic_info_signature
+        return True
+
+    @staticmethod
+    def _check_quant_mode(quant_mode: int) -> None:
+        if quant_mode not in (0, 2):
+            raise RuntimeError(
+                f"MoeDistribute V3 low latency dispatch only supports quant_mode 0 or 2, but got {quant_mode}."
+            )
+
+    @staticmethod
+    def _normalize_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
+        if topk_ids.dtype == torch.int32:
+            return topk_ids
+        return topk_ids.to(torch.int32)
+
+    @staticmethod
+    def _remap_topk_ids_for_elastic_capture(
+        topk_ids: torch.Tensor,
+        elastic_info: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if elastic_info is None or capture_dp_sync_group() is None:
+            return topk_ids
+
+        # When a new rank captures its graph alone, elastic_info may expose
+        # only the new rank's local experts. Build deterministic dummy routing
+        # inside that active expert range while keeping each token's top-k
+        # experts unique. A plain modulo remap can create duplicate experts in
+        # one token row, which CombineV3 does not handle reliably.
+        active_expert_num = torch.clamp(elastic_info[3].to(topk_ids.device), min=1)
+        row_offsets = torch.arange(
+            topk_ids.shape[0],
+            dtype=torch.int32,
+            device=topk_ids.device,
+        ).unsqueeze(1)
+        col_offsets = torch.arange(
+            topk_ids.shape[1],
+            dtype=torch.int32,
+            device=topk_ids.device,
+        ).unsqueeze(0)
+        remapped_topk_ids = torch.remainder(row_offsets + col_offsets, active_expert_num)
+        return torch.where(elastic_info[0].to(topk_ids.device) != 0, remapped_topk_ids, topk_ids)
+
+    @staticmethod
+    def _num_dispatch_tokens_for_op(topk_ids: torch.Tensor) -> int:
+        # In graph mode the MoE prepare path pads hidden_states/topk_ids to the
+        # graph bucket first, so this shape is already the stable bucket size.
+        return int(topk_ids.shape[0])
+
+    @staticmethod
+    def _get_forward_context_attr(name: str, default=None):
+        try:
+            forward_context = get_forward_context()
+        except Exception:
+            return default
+
+        additional_kwargs = getattr(forward_context, "additional_kwargs", None)
+        if additional_kwargs is not None and name in additional_kwargs:
+            return additional_kwargs[name]
+        return getattr(forward_context, name, default)
+
+    @classmethod
+    def _is_graph_mode(cls) -> bool:
+        mode = cls._get_forward_context_attr("cudagraph_runtime_mode", CUDAGraphMode.NONE)
+        if mode is None:
+            return False
+        if isinstance(mode, CUDAGraphMode):
+            return mode != CUDAGraphMode.NONE
+        try:
+            return CUDAGraphMode(mode) != CUDAGraphMode.NONE
+        except Exception:
+            return bool(mode)
+
+    @classmethod
+    def _should_pass_active_mask(cls, active_mask: torch.Tensor | None, topk_ids: torch.Tensor) -> bool:
+        if active_mask is None:
+            return False
+        if not cls._is_graph_mode():
+            return False
+        return active_mask.shape[0] == topk_ids.shape[0]
+
+    def dispatch(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+        moe_expert_num: int,
+        quant_mode: int,
+    ) -> MoETokenDispatchOutput[MoEMC2CombineMetadata]:
+        self._check_quant_mode(quant_mode)
+
+        hidden_states = token_dispatch_input.hidden_states
+        topk_ids = self._normalize_topk_ids(token_dispatch_input.topk_ids)
+        elastic_info = get_elastic_info()
+        topk_ids = self._remap_topk_ids_for_elastic_capture(topk_ids, elastic_info)
+        buffer = self._ensure_buffer(hidden_states, topk_ids, moe_expert_num)
+
+        kwargs = {
+            "x": hidden_states,
+            "topk_idx": topk_ids,
+            "num_experts": moe_expert_num,
+            "quant_mode": quant_mode,
+            "comm_alg": self._COMM_ALG,
+            "num_max_dispatch_tokens_per_rank": self._num_dispatch_tokens_for_op(topk_ids),
+        }
+        if self._should_pass_active_mask(token_dispatch_input.routing.mc2_mask, topk_ids):
+            kwargs["x_active_mask"] = token_dispatch_input.routing.mc2_mask
+        if elastic_info is not None:
+            kwargs["elastic_info"] = elastic_info
+
+        (
+            expand_x,
+            dynamic_scale,
+            assist_info_for_combine,
+            expert_token_nums,
+            ep_recv_counts,
+            expand_scales,
+        ) = buffer.npu_low_latency_dispatch(**kwargs)
+        if not token_dispatch_input.quant.dispatch_with_quant:
+            dynamic_scale = None
+
+        tp_recv_counts = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+        return MoETokenDispatchOutput(
+            hidden_states=expand_x,
+            dynamic_scale=dynamic_scale,
+            group_list=expert_token_nums,
+            group_list_type=EXPERT_TOKEN_NUMS_TYPE_COUNT,
+            combine_metadata=MoEMC2CombineMetadata(
+                topk_ids=topk_ids,
+                topk_weights=token_dispatch_input.topk_weights,
+                expert_map=token_dispatch_input.routing.expert_map,
+                ep_recv_counts=ep_recv_counts,
+                tp_recv_counts=tp_recv_counts,
+                assist_info_for_combine=assist_info_for_combine,
+                expand_scales=expand_scales,
+                quant=token_dispatch_input.quant,
+                mc2_mask=token_dispatch_input.routing.mc2_mask,
+                ori_x=hidden_states,
+            ),
+        )
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        combine_metadata: MoEMC2CombineMetadata,
+        moe_expert_num: int,
+    ) -> torch.Tensor:
+        topk_ids = self._normalize_topk_ids(combine_metadata.topk_ids)
+        buffer = self._ensure_buffer(hidden_states, topk_ids, moe_expert_num)
+
+        kwargs = {
+            "x": hidden_states,
+            "topk_idx": topk_ids,
+            "topk_weights": combine_metadata.topk_weights.to(torch.float32),
+            "assist_info_for_combine": combine_metadata.assist_info_for_combine,
+            "ep_send_counts": combine_metadata.ep_recv_counts,
+            "num_experts": moe_expert_num,
+            "comm_alg": self._COMM_ALG,
+            "num_max_dispatch_tokens_per_rank": self._num_dispatch_tokens_for_op(topk_ids),
+            "ori_x": combine_metadata.ori_x,
+            "expand_scales": combine_metadata.expand_scales,
+        }
+        if self._should_pass_active_mask(combine_metadata.mc2_mask, topk_ids):
+            kwargs["x_active_mask"] = combine_metadata.mc2_mask
+        elastic_info = get_elastic_info()
+        if elastic_info is not None:
+            kwargs["elastic_info"] = elastic_info
+
+        output = buffer.npu_low_latency_combine(**kwargs)
+        return output
+
+
+def update_moe_distribute_v3_contexts(mc2_group=None) -> int:
+    updated = 0
+    adapters = list(_MoeDistributeV3Adapter._INSTANCES)
+    skipped_no_buffer = 0
+    skipped_same_ctx = 0
+    for adapter in adapters:
+        had_buffer = adapter._buffer is not None and adapter._buffer_key is not None
+        if adapter.update_ctx_to_mc2_group(mc2_group):
+            updated += 1
+        elif not had_buffer:
+            skipped_no_buffer += 1
+        else:
+            skipped_same_ctx += 1
+    elastic_info = get_elastic_info()
+    print(
+        "[MoE V3 ctx] update_moe_distribute_v3_contexts: "
+        f"adapters={len(adapters)}, updated={updated}, "
+        f"skipped_no_buffer={skipped_no_buffer}, "
+        f"skipped_same_ctx={skipped_same_ctx}, "
+        f"elastic_info={elastic_info.detach().cpu().tolist() if elastic_info is not None else None}",
+        flush=True,
+    )
+    return updated
+
+
 class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -132,6 +469,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         else:
             max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
         num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
+        self.max_tokens_per_rank = num_tokens_per_tp_rank
         _max_global_bs = num_tokens_per_tp_rank * self.ep_world_size
 
         # When allreduce across DP is not skipped, tokens are uniform across ranks:
@@ -147,6 +485,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             raise RuntimeError(
                 "PTA and CANN version is too old to support mc2 hierarchy comm, please upgrade your version."
             )
+        self.v3_adapter = (
+            _MoeDistributeV3Adapter(self.max_tokens_per_rank)
+            if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
+            else None
+        )
         self.elastic_info = None
         self._initial_moe_expert_num = None
 
@@ -157,6 +500,58 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
+    def prepare_v3_buffer(
+        self,
+        hidden_size: int,
+        moe_expert_num: int,
+        topk: int,
+        dtype: torch.dtype,
+        device: torch.device | str = "npu",
+    ) -> bool:
+        if self.v3_adapter is None:
+            return False
+        if hidden_size <= 0 or moe_expert_num <= 0 or topk <= 0:
+            return False
+
+        self._ensure_identity_elastic_info(moe_expert_num, torch.device(device))
+        self.elastic_info = get_elastic_info()
+        if self._initial_moe_expert_num is None:
+            self._initial_moe_expert_num = moe_expert_num
+        self.moe_expert_num = self._initial_moe_expert_num if self.elastic_info is not None else moe_expert_num
+        return self.v3_adapter.ensure_buffer_for_shape(
+            hidden_size=hidden_size,
+            topk=topk,
+            moe_expert_num=self.moe_expert_num,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _ensure_identity_elastic_info(self, moe_expert_num: int, device: torch.device) -> None:
+        if get_elastic_info() is not None:
+            return
+        base_config = torch.tensor(
+            [0, self.ep_world_size, 0, moe_expert_num],
+            dtype=torch.int32,
+            device=device,
+        )
+        table = torch.arange(self.ep_world_size, dtype=torch.int32, device=device)
+        elastic_info = torch.cat([base_config, table, table], dim=0).contiguous()
+        elastic_info.requires_grad_(False)
+        set_elastic_info(elastic_info)
+
+    def _get_moe_expert_num(self, token_dispatch_input: MoETokenDispatchInput) -> int:
+        expert_map = token_dispatch_input.routing.expert_map
+        assert expert_map is not None, "expert_map is required for MC2 token dispatch."
+        return len(expert_map) + token_dispatch_input.routing.global_redundant_expert_num
+
+    def _get_dispatch_quant_mode(self, token_dispatch_input: MoETokenDispatchInput) -> int:
+        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
+        if comm_quant_mode is not None:
+            return comm_quant_mode
+        if token_dispatch_input.quant.dispatch_with_quant:
+            return 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
+        return 0
+
     def get_dispatch_mc2_kwargs(
         self,
         token_dispatch_input: MoETokenDispatchInput,
@@ -166,26 +561,16 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         topk_ids = token_dispatch_input.topk_ids
         expert_map = token_dispatch_input.routing.expert_map
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
-        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
 
         assert expert_map is not None, "expert_map is required for MC2 token dispatch."
         # NOTE: quant_mode differs by quant feature:
         # - Legacy int communication quantization uses quant_mode=2.
         # - A5 MXFP communication uses quant_mode=4.
-        if comm_quant_mode is not None:
-            quant_mode = comm_quant_mode
-        elif token_dispatch_input.quant.dispatch_with_quant:
-            quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
-        else:
-            quant_mode = 0
+        quant_mode = self._get_dispatch_quant_mode(token_dispatch_input)
+        current_moe_expert_num = len(expert_map) + global_redundant_expert_num
         if self._initial_moe_expert_num is None:
-            self._initial_moe_expert_num = len(expert_map) + global_redundant_expert_num
-        # Fault tolerance enabled(self.elastic_info is not None)
-        # Scaling down via MC2 Mask does not update self.moe_expert_num
-        if self.elastic_info is not None:
-            self.moe_expert_num = self._initial_moe_expert_num
-        else:
-            self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+            self._initial_moe_expert_num = current_moe_expert_num
+        self.moe_expert_num = self._initial_moe_expert_num if self.elastic_info is not None else current_moe_expert_num
         expert_token_nums_type = _get_expert_token_nums_type(token_dispatch_input)
         kwargs_mc2 = {
             "x": hidden_states,
@@ -197,6 +582,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             "expert_token_nums_type": expert_token_nums_type,
             "elastic_info": self.elastic_info,
         }
+        if self.elastic_info is not None:
+            kwargs_mc2["elastic_info"] = self.elastic_info
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
 
@@ -244,6 +631,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+        current_moe_expert_num = self._get_moe_expert_num(token_dispatch_input)
+        if self.v3_adapter is not None:
+            self._ensure_identity_elastic_info(current_moe_expert_num, token_dispatch_input.hidden_states.device)
+            self.elastic_info = get_elastic_info()
+            quant_mode = self._get_dispatch_quant_mode(token_dispatch_input)
+            if self._initial_moe_expert_num is None:
+                self._initial_moe_expert_num = current_moe_expert_num
+            self.moe_expert_num = (
+                self._initial_moe_expert_num if self.elastic_info is not None else current_moe_expert_num
+            )
+            return self.v3_adapter.dispatch(token_dispatch_input, self.moe_expert_num, quant_mode)
+
         self.elastic_info = get_elastic_info()
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
         output = (
@@ -261,7 +660,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             tp_recv_counts,
             expand_scales,
         ) = output[0:7]
-
         group_list_type = kwargs_mc2["expert_token_nums_type"]
         return MoETokenDispatchOutput(
             hidden_states=expand_x,
@@ -278,6 +676,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 expand_scales=expand_scales,
                 quant=token_dispatch_input.quant,
                 mc2_mask=token_dispatch_input.routing.mc2_mask if self.global_bs == 0 else None,
+                ori_x=token_dispatch_input.hidden_states,
             ),
         )
 
@@ -311,6 +710,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             "global_bs": self.global_bs,
             "elastic_info": self.elastic_info,
         }
+        if self.elastic_info is not None:
+            kwargs_mc2["elastic_info"] = self.elastic_info
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
 
@@ -348,6 +749,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
+
+        if self.v3_adapter is not None:
+            return self.v3_adapter.combine(hidden_states, combine_metadata, self.moe_expert_num)
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
         combined_output = (

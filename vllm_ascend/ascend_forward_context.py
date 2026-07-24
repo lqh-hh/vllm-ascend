@@ -285,6 +285,17 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLGATHER
 
     elif soc_version in {AscendDeviceType.A3}:
+        import vllm_ascend.envs as envs_ascend
+        from vllm_ascend.distributed.elastic_ep.v3_capture_dp_sync import (
+            is_capture_dp_sync_expected,
+            is_force_v3_during_scale_up_enabled,
+        )
+
+        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3 and (
+            is_force_v3_during_scale_up_enabled() or is_capture_dp_sync_expected()
+        ):
+            return MoECommType.MC2
+
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
         fused_mc2_enable = get_ascend_config().enable_fused_mc2

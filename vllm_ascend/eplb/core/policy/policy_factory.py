@@ -25,7 +25,8 @@ class PolicyFactory:
             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
             # Multi-Shot Enhancement and Incremental Adjustment
             3: FlashLB,
-            # Redistribute expert weights on the xPU via H2D and D2D after a card failure.
+            # Fault/external scale-down policy: remove excluded ranks, keep
+            # all logical experts covered, and report H2D reload slots.
             4: FaultRearrangement,
         }
         policy_class = policy.get(policy_type)

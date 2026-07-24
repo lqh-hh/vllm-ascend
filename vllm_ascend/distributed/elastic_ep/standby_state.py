@@ -13,6 +13,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 _STANDBY_MC2: StatelessGroupCoordinator | None = None
 _STANDBY_DYNAMIC_EPLB: StatelessGroupCoordinator | None = None
 _STANDBY_FC3_QUANT_X: StatelessGroupCoordinator | None = None
+_STANDBY_V3_CAPTURE_DP: StatelessGroupCoordinator | None = None
 
 
 def get_standby_mc2_group() -> StatelessGroupCoordinator | None:
@@ -27,6 +28,15 @@ def get_standby_fc3_quant_x_group() -> StatelessGroupCoordinator | None:
     return _STANDBY_FC3_QUANT_X
 
 
+def get_standby_v3_capture_dp_group() -> StatelessGroupCoordinator | None:
+    return _STANDBY_V3_CAPTURE_DP
+
+
+def set_standby_v3_capture_dp_group(group: StatelessGroupCoordinator | None) -> None:
+    global _STANDBY_V3_CAPTURE_DP
+    _STANDBY_V3_CAPTURE_DP = group
+
+
 def create_ascend_standby_groups(
     new_dp_size: int,
     new_world_size_across_dp: int,
@@ -34,7 +44,7 @@ def create_ascend_standby_groups(
     coord_store_port: int,
     backend: str | None = None,
 ) -> None:
-    global _STANDBY_MC2, _STANDBY_DYNAMIC_EPLB, _STANDBY_FC3_QUANT_X
+    global _STANDBY_MC2, _STANDBY_DYNAMIC_EPLB, _STANDBY_FC3_QUANT_X, _STANDBY_V3_CAPTURE_DP
 
     assert new_world_size_across_dp == torch.distributed.get_world_size() * new_dp_size
     world_group = get_world_group()
@@ -49,6 +59,10 @@ def create_ascend_standby_groups(
     all_ranks = torch.arange(new_world_size_across_dp).reshape(-1, new_dp_size * pp_size * tp_size)
     group_ranks = all_ranks.unbind(0)
     standby_ep_ranks = [x.tolist() for x in group_ranks]
+
+    all_ranks_for_dp = torch.arange(new_world_size_across_dp).reshape(-1, new_dp_size, pp_size, tp_size)
+    standby_dp_ranks = all_ranks_for_dp.transpose(1, 3).reshape(-1, new_dp_size).unbind(0)
+    standby_dp_ranks = [x.tolist() for x in standby_dp_ranks]
 
     _STANDBY_MC2 = _init_stateless_group(
         standby_ep_ranks,
@@ -75,6 +89,15 @@ def create_ascend_standby_groups(
             backend,
             coord_store=coord_store,
         )
+
+    _STANDBY_V3_CAPTURE_DP = _init_stateless_group(
+        standby_dp_ranks,
+        "v3_capture_dp",
+        master_ip,
+        "gloo",
+        use_device_communicator=False,
+        coord_store=coord_store,
+    )
 
 
 def pop_ascend_standby_groups() -> dict:

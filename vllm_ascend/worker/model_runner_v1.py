@@ -119,6 +119,16 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.elastic_ep.v3_capture_dp_sync import (
+    capture_dp_sync_group,
+    complete_dp_metadata_collective,
+    describe_capture_dp_sync_state,
+    enter_dp_metadata_collective,
+    is_capture_dp_sync_expected,
+    is_old_active_dp_sync_enabled,
+    notify_capture_dp_allreduce,
+    old_active_dp_sync_group,
+)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -507,7 +517,21 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
             self.shared_dict = self.manager.dict(
-                {"expert_map": None, "moe_load": None, "expert_maps": None, "scale_down": False, "update_layer_id": -1})
+                {
+                    "expert_map": None,
+                    "moe_load": None,
+                    "expert_maps": None,
+                    "scale": False,
+                    "scale_down": False,
+                    "enable_d2d_after_failure": False,
+                    "excluded_dp_ranks": [],
+                    "need_load_h2d": None,
+                    "num_add_experts_per_rank": 0,
+                    "old_ep_size": None,
+                    "new_ep_size": None,
+                    "update_layer_id": -1,
+                }
+            )
             self.eplb_process = EplbProcess(
                 shared_dict=self.shared_dict,
                 policy_type=self.policy_type,
@@ -515,7 +539,13 @@ class NPUModelRunner(GPUModelRunner):
                 tp_size=self.parallel_config.tensor_parallel_size,
             )
             self.process = self.eplb_process._launch_process()
-            self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process, self.parallel_config.enable_elastic_ep)
+            self.eplb_updator = EplbUpdator(
+                eplb_config,
+                self.eplb_loader,
+                self.eplb_process,
+                self.process,
+                self.parallel_config.enable_elastic_ep,
+            )
             # In pd colocation scenarios, we find that prefill/decode requests result in different
             # expert workloads. To reduce expert imbalance more effectively, we can coolect eplb
             # heat exclusively on a single stage rather than both prefill/decode.
@@ -607,6 +637,17 @@ class NPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         torch.npu.synchronize()
 
+    def _should_skip_eplb_forward_end_for_elastic_capture(self) -> bool:
+        if not self.dynamic_eplb:
+            return False
+        if not is_old_active_dp_sync_enabled():
+            return False
+        logger.info_once(
+            "[Elastic EP scale-up] skip dynamic EPLB forward_end while "
+            "new rank is capturing with old-active ranks"
+        )
+        return True
+
     def _set_up_drafter(self):
         # Set up speculative decoding.
         self.drafter: (
@@ -674,36 +715,85 @@ class NPUModelRunner(GPUModelRunner):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
-        if self.dp_size == 1:
+        old_active_sync = old_active_dp_sync_group()
+        effective_dp_size = self.dp_size
+        effective_dp_rank = self.dp_rank
+        effective_sync_group = None
+        if old_active_sync is not None and capture_dp_sync_group() is None:
+            effective_sync_group, effective_dp_rank, effective_dp_size = old_active_sync
+            logger.info_once(
+                "[Elastic EP scale-up] DP metadata all_reduce uses old-active "
+                "DP group during new-rank capture: dp_rank=%s/%s, "
+                "runtime_dp_rank=%s/%s",
+                effective_dp_rank,
+                effective_dp_size,
+                self.dp_rank,
+                self.dp_size,
+            )
+
+        if effective_dp_size == 1:
             return num_tokens, None, cudagraph_mode
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
-            num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
+            num_tokens_after_padding = torch.tensor([num_tokens] * effective_dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        # On certain devices, CPU-side all_reduce may return dirty data.
-        # When dp_allreduce_on_npu is True, route DP metadata
-        # synchronization through the NPU device group to avoid data corruption.
-        device_str, group = (
-            ("npu", get_dp_group().device_group)
-            if self.ascend_config.dp_allreduce_on_npu
-            else ("cpu", get_dp_group().cpu_group)
+        sync_group = capture_dp_sync_group()
+        if sync_group is None:
+            if is_capture_dp_sync_expected():
+                raise RuntimeError(
+                    "V3 new-rank capture DP sync is expected but no "
+                    "dedicated sync group is active; refusing to fall back "
+                    "to the normal DP cpu group. "
+                    f"state={describe_capture_dp_sync_state()}"
+                )
+        else:
+            notify_capture_dp_allreduce()
+
+        if sync_group is not None:
+            device_str, group = "cpu", sync_group
+        elif effective_sync_group is not None:
+            device_str, group = "cpu", effective_sync_group
+        elif self.ascend_config.dp_allreduce_on_npu:
+            device_str, group = "npu", get_dp_group().device_group
+        else:
+            device_str, group = "cpu", get_dp_group().cpu_group
+
+        collective_epoch = (
+            enter_dp_metadata_collective() if sync_group is None else None
         )
-        packed_tensor = torch.zeros(2, self.dp_size, device=device_str, dtype=torch.int32)
-        packed_tensor[0][self.dp_rank] = num_tokens
-        packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        metadata_rows = 3 if collective_epoch is not None else 2
+        packed_tensor = torch.zeros(
+            metadata_rows, effective_dp_size, device=device_str, dtype=torch.int32
+        )
+        packed_tensor[0][effective_dp_rank] = num_tokens
+        packed_tensor[1][effective_dp_rank] = cudagraph_mode.value
+        if collective_epoch is not None:
+            packed_tensor[2][effective_dp_rank] = collective_epoch
         try:
             dist.all_reduce(packed_tensor, group=group)
         except RuntimeError as e:
             if self.fault_tolerance:
-                raise Exception(
-                    'All-reduce across DP ranks failed, likely due to a rank failure. '
-                    'Pausing the engine loop to allow for recovery.'
+                raise RuntimeError(
+                    "All-reduce across DP ranks failed, likely due to a rank "
+                    "failure. Pausing the engine loop to allow for recovery."
                 ) from e
-            else:
-                raise
+            raise
         if device_str == "npu":
             packed_tensor = packed_tensor.cpu()
+        synced_epoch = (
+            int(packed_tensor[2].max().item())
+            if collective_epoch is not None
+            else None
+        )
+        complete_dp_metadata_collective(collective_epoch, synced_epoch)
+
+        if sync_group is not None:
+            # Existing ranks only run a companion all_reduce during new-rank
+            # graph capture. Their placeholder zeros must not affect the new
+            # rank's padding or cudagraph-mode decision.
+            num_tokens_after_padding = torch.tensor([num_tokens] * effective_dp_size, device="cpu", dtype=torch.int32)
+            return num_tokens, num_tokens_after_padding, cudagraph_mode
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
@@ -713,7 +803,7 @@ class NPUModelRunner(GPUModelRunner):
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
             num_tokens_after_padding = torch.tensor(
-                [max_tokens_across_dp] * self.dp_size, device="cpu", dtype=torch.int32
+                [max_tokens_across_dp] * effective_dp_size, device="cpu", dtype=torch.int32
             )
         else:
             num_tokens_after_padding = num_tokens_across_dp.cpu()
@@ -2536,7 +2626,7 @@ class NPUModelRunner(GPUModelRunner):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
-        if self.dynamic_eplb:
+        if self.dynamic_eplb and not self._should_skip_eplb_forward_end_for_elastic_capture():
             self.eplb_updator.forward_end(self.eplb_heat_collection_status)
 
         self._finalize_dump_data()
@@ -3623,7 +3713,11 @@ class NPUModelRunner(GPUModelRunner):
                 )
             if is_profile and self.dynamic_eplb:
                 self.eplb_updator.adaptor.clear_all_moe_loads()
-            if not is_profile and self.dynamic_eplb:
+            if (
+                not is_profile
+                and self.dynamic_eplb
+                and not self._should_skip_eplb_forward_end_for_elastic_capture()
+            ):
                 self.eplb_updator.forward_end(self.eplb_heat_collection_status)
             self._finalize_dump_data(dump=False)
             if self.use_compress and force_attention:

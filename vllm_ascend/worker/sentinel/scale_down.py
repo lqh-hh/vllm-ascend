@@ -288,7 +288,8 @@ def update_elastic_info(
         ],
         dim=0,
     )
-    elastic_info.copy_(new_elastic_info_cpu)
+    with torch.inference_mode():
+        elastic_info.copy_(new_elastic_info_cpu)
     set_elastic_info(elastic_info)
 
 
@@ -544,7 +545,7 @@ class ScaleDownHelper:
         model_runner = self.model_runner
 
         model_runner.eplb_adaptor.rank_id = rank
-        model_runner.eplb_adaptor.model.clear_all_moe_loads()
+        model_runner.eplb_adaptor.clear_all_moe_loads()
         model_runner.shared_dict["moe_load"] = None
 
         model_runner.eplb_updator.cur_iterations = 0

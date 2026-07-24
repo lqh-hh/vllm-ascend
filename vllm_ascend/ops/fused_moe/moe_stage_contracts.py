@@ -94,6 +94,7 @@ class MoEMC2CombineMetadata:
     expand_scales: torch.Tensor | None
     quant: MoEQuantParams
     mc2_mask: torch.Tensor | None = None
+    ori_x: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

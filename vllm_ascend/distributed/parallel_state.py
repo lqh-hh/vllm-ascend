@@ -1,3 +1,5 @@
+import os
+
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import get_cached_tcp_store_client
@@ -44,9 +46,12 @@ def set_elastic_info(elastic_info):
     global _ELASTIC_INFO
     if _ELASTIC_INFO is None or elastic_info is None:
         _ELASTIC_INFO = elastic_info
+    elif _ELASTIC_INFO is elastic_info:
+        return
     else:
         assert _ELASTIC_INFO.shape == elastic_info.shape
-        _ELASTIC_INFO.copy_(elastic_info)
+        with torch.inference_mode():
+            _ELASTIC_INFO.copy_(elastic_info)
 
 
 def init_ascend_model_parallel(
@@ -174,6 +179,21 @@ def init_ascend_model_parallel(
             _FC3_QUANT_X = init_model_parallel_group(
                 group_ranks, get_world_group().local_rank, backend, group_name="fc3_quant_x"
             )
+
+    if enable_elastic_ep and os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1":
+        from vllm_ascend.distributed.elastic_ep.standby_state import set_standby_v3_capture_dp_group
+
+        dp_group_ranks = all_ranks.transpose(1, 4).reshape(-1, global_dp_size).unbind(0)
+        dp_group_ranks = [x.tolist() for x in dp_group_ranks]
+        v3_capture_dp_group = _init_stateless_group(
+            dp_group_ranks,
+            "v3_capture_dp",
+            parallel_config.data_parallel_master_ip,
+            "gloo",
+            use_device_communicator=False,
+            coord_store=coord_store,
+        )
+        set_standby_v3_capture_dp_group(v3_capture_dp_group)
 
     # Initialize fine-grained TP process groups on Ascend for four components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
@@ -312,6 +332,11 @@ def _replace_ascend_active_groups(
     _MC2 = mc2
     _DYNAMIC_EPLB = dynamic_eplb
     _FC3_QUANT_X = fc3_quant_x
+
+
+def _replace_dynamic_eplb_group(dynamic_eplb: GroupCoordinator | None) -> None:
+    global _DYNAMIC_EPLB
+    _DYNAMIC_EPLB = dynamic_eplb
 
 
 def model_parallel_initialized():

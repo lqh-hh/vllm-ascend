@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch_npu
-from torch.distributed import P2POp
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import logger
@@ -103,13 +102,30 @@ class ElasticEplbManager:
         num_local_experts = old_expert_maps.max() + 1
         old_placement = global2local(old_expert_maps, num_local_experts)
 
-        local_load = self.eplb_adaptor.get_rank_expert_workload().unsqueeze(1)
-        moe_load = get_dynamic_eplb_group().all_gather(local_load, dim=1).cpu()
+        local_load = self.eplb_adaptor.get_rank_expert_workload().cpu()
+
+        # The policy consumes CPU workloads. Gathering them with the device
+        # communicator would pay the first-use PyHCCL cost only to copy the
+        # result back to CPU immediately. Reuse the established dynamic EPLB
+        # CPU/Gloo path instead.
+        dynamic_eplb_group = get_dynamic_eplb_group()
+        group_world_size = dist.get_world_size(group=dynamic_eplb_group.cpu_group)
+        gather_list = [
+            torch.empty_like(local_load)
+            for _ in range(group_world_size)
+        ]
+        dist.all_gather(
+            gather_list,
+            local_load,
+            group=dynamic_eplb_group.cpu_group,
+        )
+        moe_load = torch.stack(gather_list, dim=0).permute(1, 0, 2)
         if old_ep_size < new_ep_size:
             moe_load = moe_load[:, :old_ep_size]
 
         self.policy.set_new_ep_size(new_ep_size)
         new_placement = self.policy.rebalance_experts(old_placement, moe_load)
+
         new_placement = torch.tensor(new_placement)
         new_expert_maps = local2global(new_placement)
 
@@ -129,91 +145,32 @@ class ElasticEplbManager:
             new_expert_maps = torch.cat([new_expert_maps, torch.full(shape, -1)], dim=1)
 
         update_info = compose_expert_update_info_greedy_optimized(new_expert_maps, old_expert_maps)
-
         for send_info, recv_info, new_expert_map, layer_id in update_info:
             send_info_this_rank = send_info.get(self.rank_id, [])
             recv_info_this_rank = recv_info.get(self.rank_id, [])
-            new_expert_map_this_rank = new_expert_map[self.rank_id]
+
             new_log2phy_map_this_rank = generate_log2phy_map(new_expert_map, self.rank_id)
             layer_id += self.eplb_adaptor.num_dense_layers
 
-            recv_expert_list = self.d2d_transfer_experts(
+            self.eplb_loader.set_log2phy_map(new_log2phy_map_this_rank)
+            self.eplb_loader.generate_expert_d2d_transfer_task(
                 send_info_this_rank,
                 recv_info_this_rank,
-                new_expert_map_this_rank,
+                new_expert_map,
                 layer_id,
             )
 
-            self.update_expert_map_and_weight(
-                new_expert_map_this_rank,
-                new_log2phy_map_this_rank,
-                recv_expert_list,
-                layer_id,
-            )
+            reqs = []
+            self.eplb_loader.asyn_expert_weight_transfer(reqs)
+            self.eplb_loader.update_expert_map_and_weight(reqs)
 
-        self.eplb_adaptor.model.clear_all_moe_loads()
+        self.eplb_adaptor.clear_all_moe_loads()
         self.eplb_updator.cur_iterations = 0
+
         torch_npu.npu.synchronize()
 
         if self.rank_id == 0:
             logger.info("[Elastic EP] EPLB finished, new expert parallel size: %s", new_ep_size)
-
-    def d2d_transfer_experts(
-        self,
-        expert_send_info: list,
-        expert_recv_info: list,
-        updated_expert_map: torch.Tensor,
-        layer_id: int,
-    ) -> list[tuple[int, int]]:
-        p2p_ops = []
-
-        for send_info in expert_send_info:
-            dst_rank, global_expert_id_to_send = send_info
-            local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
-            for index, src_tensor in enumerate(self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]):
-                op = object.__new__(P2POp)
-                op.op = dist.isend
-                op.tensor = src_tensor
-                op.group_peer = dst_rank
-                p2p_ops.append((op, global_expert_id_to_send))
-
-        recv_expert_list = []
-        for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
-            recv_rank, global_expert_id_to_recv = recv_info
-            for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]:
-                op = object.__new__(P2POp)
-                op.op = dist.irecv
-                op.tensor = buffer_tensor
-                op.group_peer = recv_rank
-                p2p_ops.append((op, global_expert_id_to_recv))
-            local_expert_to_replace = updated_expert_map[global_expert_id_to_recv].item()
-            recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
-
-        p2p_ops = sorted(p2p_ops, key=lambda x: x[1])
-        p2p_ops = [item[0] for item in p2p_ops]
-
-        device_communicator = get_dynamic_eplb_group().device_communicator
-        device_communicator.batch_isend_irecv(p2p_ops)
-
-        return recv_expert_list
-
-    def update_expert_map_and_weight(
-        self,
-        updated_expert_map: torch.Tensor,
-        updated_log2phy_map: torch.Tensor,
-        recv_expert_list: list[tuple[int, int]],
-        layer_id: int,
-    ):
-        # update expert_map
-        self.eplb_adaptor.do_update_expert_map(layer_id, updated_expert_map)
-
-        # update log2phy_map
-        self.eplb_adaptor.do_update_log2phy_map(layer_id, updated_log2phy_map)
-
-        # update expert weight
-        for recv_expert_info in recv_expert_list:
-            local_expert_to_replace, buffer_tensor_id = recv_expert_info
-            self.eplb_adaptor.do_update_expert_weight(layer_id, local_expert_to_replace, buffer_tensor_id)
 
 
 def compose_expert_update_info_greedy_optimized(

@@ -12,6 +12,7 @@ from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.distributed.utils import create_tcp_store
 from vllm.logger import init_logger
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.serial_utils import run_method
@@ -38,6 +39,7 @@ class WorkerSentinel:
         self.dp_rank = worker.parallel_config.data_parallel_rank
         self.dp_size = worker.parallel_config.data_parallel_size
         self.data_parallel_master_ip = worker.parallel_config.data_parallel_master_ip
+        self._fault_coord_store = None
         self.set_dp_gloo_timeout()
 
     def set_dp_gloo_timeout(self) -> None:
@@ -93,9 +95,12 @@ class WorkerSentinel:
         removed_dp_ranks = ft_request.params["removed_dp_ranks"]
         new_dp_size = ft_request.params["new_dp_size"]
         new_stateless_dp_group_port = ft_request.params["new_stateless_dp_group_port"]
-        new_stateless_eplb_group_port = ft_request.params["new_stateless_eplb_group_port"]
-
-        num_logical_expert = self.worker.num_logical_expert
+        new_stateless_coord_store_port = ft_request.params[
+            "new_stateless_coord_store_port"
+        ]
+        new_master_ip = ft_request.params.get(
+            "dp_master_ip", self.data_parallel_master_ip
+        )
 
         enable_d2d_rebalance = get_ascend_config().enable_d2d_rebalance
 
@@ -133,6 +138,26 @@ class WorkerSentinel:
         else:
             all_layer_log2phy = scale_down_helper.gen_all_layer_log2phy(new_dp_rank)
 
+        elastic_ep_executor = self.worker.elastic_ep_executor
+        if elastic_ep_executor is None:
+            raise RuntimeError(
+                "Fault scale-down requires the Elastic EP scaling executor"
+            )
+        if new_dp_rank == 0:
+            self._fault_coord_store = create_tcp_store(
+                new_master_ip,
+                new_stateless_coord_store_port,
+                world_size=-1,
+                is_master=True,
+                wait_for_workers=False,
+            )
+        elastic_ep_executor.create_fault_scale_down_metadata_groups(
+            new_dp_size,
+            new_dp_rank,
+            new_master_ip,
+            new_stateless_coord_store_port,
+        )
+
         self.worker.global_experts_distribution = self.worker.model_runner.eplb_process.worker.local2global(
             self.worker.model_runner.shared_dict["expert_maps"]
         )
@@ -140,6 +165,10 @@ class WorkerSentinel:
         # Phase 5: Configuration and state update
         old_ep_size = len(self.worker.ep2dp_map)
         scale_down_helper.update_parallel_config(new_dp_size, new_dp_rank, new_stateless_dp_group_port)
+        self.worker.vllm_config.parallel_config.data_parallel_master_ip = (
+            new_master_ip
+        )
+        self.data_parallel_master_ip = new_master_ip
         self.dp_size = self.worker.vllm_config.parallel_config.data_parallel_size
         self.dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
         self.worker.model_runner.dp_size = self.dp_size
@@ -156,12 +185,29 @@ class WorkerSentinel:
         scale_down_helper.update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.worker.ep2dp_map)
 
         # Phase 6: Communication group reinitialization
-        scale_down_helper.destroy_comm_group()
-        with set_current_vllm_config(self.worker.vllm_config):
-            scale_down_helper.init_dp_cpu_group(new_stateless_dp_group_port, new_stateless_eplb_group_port)
+        elastic_ep_executor.commit_fault_scale_down_metadata_groups()
+        active_dp_group = get_dp_group()
+        active_dp_size = active_dp_group.world_size
+        active_dp_rank = active_dp_group.rank_in_group
+        if active_dp_size != new_dp_size or active_dp_rank != new_dp_rank:
+            raise RuntimeError(
+                "Fault scale-down left inconsistent DP metadata: "
+                f"group_rank={active_dp_rank}/{active_dp_size}, "
+                f"config_rank={new_dp_rank}/{new_dp_size}"
+            )
 
-        # Phase 7: MoE reconfiguration
-        scale_down_helper.reconfigure_moe(num_logical_expert, num_new_phy_experts, all_layer_log2phy)
+        # Phase 7: update routing without changing the captured MoE/MC2
+        # physical dimensions. This matches active scale-down and keeps the
+        # V3 restore scale-up path compatible with the existing ACL graphs.
+        elastic_ep_executor.apply_fault_scale_down_log2phy(all_layer_log2phy)
+        logger.info(
+            "[FT] Worker scale-down metadata committed: dp_rank=%s/%s, "
+            "dp_group_rank=%s/%s",
+            self.dp_rank,
+            self.dp_size,
+            active_dp_rank,
+            active_dp_size,
+        )
 
     def _clean_worker_state(self):
         import torch_npu

@@ -47,6 +47,73 @@ class DefaultElasticEplb(EplbPolicy):
         return workload_new
 
     @staticmethod
+    def build_stable_scale_up_placement(
+        current_expert_table,
+        layer_workloads,
+        new_ep_size,
+        num_original_expert,
+    ):
+        """Build an expanded placement without moving experts on old ranks."""
+        layer_num, old_ep_size, experts_per_npu = current_expert_table.shape
+        if new_ep_size <= old_ep_size:
+            raise ValueError(
+                f"new_ep_size {new_ep_size} must be greater than "
+                f"old_ep_size {old_ep_size}"
+            )
+
+        new_placement = np.full(
+            (layer_num, new_ep_size, experts_per_npu),
+            fill_value=-1,
+            dtype=current_expert_table.dtype,
+        )
+        new_placement[:, :old_ep_size, :] = current_expert_table
+
+        for layer_id in range(layer_num):
+            current_layer = current_expert_table[layer_id]
+            if np.any(current_layer < 0) or np.any(
+                current_layer >= num_original_expert
+            ):
+                raise ValueError(
+                    "current_expert_table contains an invalid expert ID"
+                )
+
+            replica_counts = np.bincount(
+                current_layer.reshape(-1),
+                minlength=num_original_expert,
+            )
+            if np.any(replica_counts == 0):
+                raise ValueError(
+                    "current_expert_table must cover every logical expert"
+                )
+
+            for rank_id in range(old_ep_size, new_ep_size):
+                assigned_to_rank = np.zeros(num_original_expert, dtype=bool)
+                for slot_id in range(experts_per_npu):
+                    eligible = (
+                        (replica_counts < new_ep_size) & ~assigned_to_rank
+                    )
+                    if not np.any(eligible):
+                        raise ValueError(
+                            f"cannot fill rank {rank_id} without duplicate experts"
+                        )
+
+                    per_replica_workload = np.full(
+                        num_original_expert,
+                        fill_value=-np.inf,
+                        dtype=np.float64,
+                    )
+                    per_replica_workload[eligible] = (
+                        layer_workloads[layer_id][eligible]
+                        / replica_counts[eligible]
+                    )
+                    expert_id = int(np.argmax(per_replica_workload))
+                    new_placement[layer_id, rank_id, slot_id] = expert_id
+                    assigned_to_rank[expert_id] = True
+                    replica_counts[expert_id] += 1
+
+        return new_placement
+
+    @staticmethod
     # Split hot (high-load) experts into redundant experts
     def original_compute_balanced_pack_redundancy(origin_weights, card_num, num_redundancy_expert):
         # Step 1: Sort the items by weight in descending order (we are sorting by weight now)
@@ -251,12 +318,12 @@ class DefaultElasticEplb(EplbPolicy):
         info.workload_table = np.array(expert_workload)
         info.placement_table = np.array(current_expert_table)
         assert info.workload_table is not None
-        layer_num, num_npus, experts_per_npu = info.workload_table.shape
+        layer_num, old_num_npus, experts_per_npu = info.workload_table.shape
         assert info.placement_table is not None
         row = cast(np.ndarray, info.placement_table[0])
         expert_ids, counts = np.unique(row, return_counts=True)
         num_original_expert = len(expert_ids)
-        assert self._new_ep_size is not None and self._new_ep_size != num_npus
+        assert self._new_ep_size is not None and self._new_ep_size != old_num_npus
         num_npus = self._new_ep_size
         num_redundancy_expert = experts_per_npu * self._new_ep_size - num_original_expert
         layer_workloads = self.add_redundant(info.placement_table, info.workload_table, num_original_expert)
@@ -284,6 +351,16 @@ class DefaultElasticEplb(EplbPolicy):
                 f"num_npus {num_npus} * experts_per_npu {experts_per_npu} "
                 f"can't be less than num_original_expert {num_original_expert}"
             )
+
+        if num_npus > old_num_npus:
+            new_global_deployment = self.build_stable_scale_up_placement(
+                info.placement_table,
+                layer_workloads,
+                num_npus,
+                num_original_expert,
+            )
+            self._new_ep_size = None
+            return new_global_deployment.tolist()
 
         # Number of experts deployed on each card includes one redundant expert
         global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]

@@ -19,11 +19,13 @@ import json
 from typing import Any
 
 import torch
+import torch_npu
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.quantization.methods.base import QuantType
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ
 
 EPLB_EXPERT_WEIGHT_NAMES = {
     (QuantType.NONE, False): ("w13_weight", "w2_weight"),
@@ -54,6 +56,18 @@ EPLB_EXPERT_WEIGHT_NAMES = {
     (QuantType.MXFP4, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
     (QuantType.MXFP8, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
     (QuantType.MXFP8, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+}
+
+EPLB_EXPERT_WEIGHT_TRANSFER_AS_ND = {
+    (QuantType.NONE, False): (False, False),
+    (QuantType.NONE, True): (False, False),
+    (QuantType.W8A8, False): (True, True, False, False),
+    (QuantType.W8A8, True): (True, True, False, False, False, False),
+    (QuantType.W4A8, True): (True, True, False, False, False, False),
+    (QuantType.MXFP4, False): (False, False, False, False),
+    (QuantType.MXFP4, True): (False, False, False, False),
+    (QuantType.MXFP8, False): (False, False, False, False),
+    (QuantType.MXFP8, True): (False, False, False, False),
 }
 
 
@@ -107,6 +121,7 @@ class VllmEplbAdaptor:
         for local_idx, _ in enumerate(self.moe_layers):
             expert_weight_key = self.expert_weight_key_per_layer[local_idx]
             expert_weight_names = EPLB_EXPERT_WEIGHT_NAMES[expert_weight_key]
+            transfer_as_nd = EPLB_EXPERT_WEIGHT_TRANSFER_AS_ND[expert_weight_key]
             expert_tensors = [self.param_dict[f"{local_idx}.{name}"][0] for name in expert_weight_names]
             expert_tensor_shapes = [tensor.shape for tensor in expert_tensors]
             if expert_weight_key in self.buffer_tensor_list:
@@ -118,13 +133,15 @@ class VllmEplbAdaptor:
             buffer_tensor_shapes[expert_weight_key] = expert_tensor_shapes
             self.buffer_tensor_list[expert_weight_key] = [[] for _ in range(num_buffer_tensor)]
             for buffer_id in range(num_buffer_tensor):
-                for expert_tensor in expert_tensors:
+                for expert_tensor, needs_nd_transfer in zip(expert_tensors, transfer_as_nd):
                     buffer_tensor = torch.empty_like(expert_tensor)
+                    if needs_nd_transfer:
+                        buffer_tensor = torch_npu.npu_format_cast(buffer_tensor, ACL_FORMAT_FRACTAL_ND)
                     self.buffer_tensor_list[expert_weight_key][buffer_id].append(buffer_tensor)
 
     def start_init_buffer_tensor(self):
         num_buffer_tensor = self.num_local_experts
-        self.buffer_tensor_list: list[list[Any]] = [[] for _ in range(num_buffer_tensor)]
+        self.buffer_tensor_list: dict[Any, list[list[Any]]] = {}
         self.init_buffer_tensor(num_buffer_tensor)
 
     def init_expert_param_per_layer(self):
@@ -190,24 +207,36 @@ class VllmEplbAdaptor:
 
     def do_update_expert_weight(self, layer_id, local_expert_to_replace, buffer_tensor_id):
         expert_weight_key = self.expert_weight_key_per_layer[layer_id]
-        for expert_tensor, buffer_tensor in zip(
+        transfer_as_nd = EPLB_EXPERT_WEIGHT_TRANSFER_AS_ND[expert_weight_key]
+        for expert_tensor, buffer_tensor, needs_nd_transfer in zip(
             self.expert_param_per_layer[layer_id][local_expert_to_replace],
             self.buffer_tensor_list[expert_weight_key][buffer_tensor_id],
+            transfer_as_nd,
         ):
-            expert_tensor.copy_(buffer_tensor)
+            if needs_nd_transfer:
+                formatted_buffer = torch_npu.npu_format_cast(buffer_tensor, ACL_FORMAT_FRACTAL_NZ)
+                torch_npu.copy_memory_(expert_tensor, formatted_buffer)
+            else:
+                expert_tensor.copy_(buffer_tensor)
             logger.debug("Expert tensor shape is :%s", expert_tensor.shape)
 
     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):
-        if self.log2phy_map_per_layer[layer_id] is not None:
-            self.log2phy_map_per_layer[layer_id].copy_(updated_log2phy_map)
+        target = self.log2phy_map_per_layer[layer_id]
+        if target is not None:
+            staged_log2phy_map = updated_log2phy_map.to(
+                device=target.device,
+                dtype=target.dtype,
+            )
+            target.copy_(staged_log2phy_map)
 
     def get_global_expert_map(self):
         all_layer_global_expert_map = []
         for local_idx, layer in enumerate(self.moe_layers):
             map_cpu = layer.global_expert_map.cpu()
             all_layer_global_expert_map.append(map_cpu)
-            self.expert_map_per_layer_cpu[self.num_dense_layers + layer_id] = map_cpu[self.rank_id]
-            self.global_expert_map_per_layer_cpu[self.num_dense_layers + layer_id] = map_cpu.clone()
+            layer_id = self.num_dense_layers + local_idx
+            self.expert_map_per_layer_cpu[layer_id] = map_cpu[self.rank_id]
+            self.global_expert_map_per_layer_cpu[layer_id] = map_cpu.clone()
 
         return torch.stack(all_layer_global_expert_map)
 

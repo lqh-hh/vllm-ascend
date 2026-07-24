@@ -41,6 +41,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandsha
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
@@ -60,7 +61,16 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.elastic_ep.v3_capture_dp_sync import (
+    configure_dp_collective_state,
+    finish_new_rank_capture_dp_sync,
+)
+from vllm_ascend.distributed.parallel_state import (
+    get_elastic_info,
+    get_mc2_group,
+    init_ascend_model_parallel,
+    set_elastic_info,
+)
 from vllm_ascend.distributed.utils import use_stateless_pg_with_world_registration
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -75,7 +85,11 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
-from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
+from vllm_ascend.worker.sentinel.scale_down import (
+    init_elastic_info,
+    init_ep2dp_map,
+    patch_get_all_weights,
+)
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -220,6 +234,9 @@ class NPUWorker(WorkerBase):
 
             self.model_loaded = False
             init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
+
+    def set_elastic_ep_dp_collective_state(self, state: torch.Tensor) -> None:
+        configure_dp_collective_state(state)
 
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
@@ -749,12 +766,12 @@ class NPUWorker(WorkerBase):
             self.model_runner._saved_expert_weights_dict = self.weight_name_to_tensor
 
         with context, set_current_vllm_config(self.vllm_config):
-            drafter = getattr(self.model_runner, "drafter_model", None)
-            drafter_model = getattr(drafter, "model", None)
-            with patch_get_all_weights(
-                self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
-            ):
+            if load_dummy_weights:
                 self.model_runner.load_model(load_dummy_weights)
+            else:
+                drafter_model = getattr(getattr(self.model_runner, "drafter", None), "model", None)
+                with patch_get_all_weights(self.weight_name_to_tensor, True, drafter_model):
+                    self.model_runner.load_model(load_dummy_weights)
 
         self.model_runner.eplb_warmup()
         if self.parallel_config.enable_elastic_ep:
@@ -770,6 +787,44 @@ class NPUWorker(WorkerBase):
                 self.vllm_config.parallel_config,
                 self.model_runner.get_model(),
             )
+
+    def _restore_identity_elastic_info_after_capture(self) -> None:
+        if not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+            return
+
+        elastic_info = get_elastic_info()
+        if elastic_info is None:
+            return
+        try:
+            is_elastic = bool(elastic_info[0].item())
+        except RuntimeError:
+            is_elastic = bool(elastic_info.detach().cpu()[0].item())
+        if not is_elastic:
+            return
+
+        ep_size = get_mc2_group().world_size
+        if elastic_info.numel() != 4 + 2 * ep_size:
+            return
+
+        moe_modules = [module for module in self.model_runner.get_model().modules() if isinstance(module, FusedMoE)]
+        if not moe_modules:
+            return
+
+        moe_expert_num = moe_modules[0].moe_config.num_experts
+        device = elastic_info.device
+        base_config = torch.tensor(
+            [0, ep_size, 0, moe_expert_num],
+            dtype=torch.int32,
+            device=device,
+        )
+        table = torch.arange(ep_size, dtype=torch.int32, device=device)
+        identity_elastic_info = torch.cat([base_config, table, table], dim=0).contiguous()
+        identity_elastic_info.requires_grad_(False)
+        set_elastic_info(identity_elastic_info)
+        logger.info(
+            "[Elastic EP scale-up] restored identity elastic_info after new-rank graph capture: elastic_info=%s",
+            identity_elastic_info.detach().cpu().tolist(),
+        )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Note: need to adapt for graph mode.
@@ -791,13 +846,17 @@ class NPUWorker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size)
-
         npugraph_memory_bytes = 0
-        if not self.model_config.enforce_eager:
-            npugraph_memory_bytes = self.model_runner.capture_model()
+        try:
+            for size in sorted(warmup_sizes, reverse=True):
+                logger.info("Compile and warming up model for size %d", size)
+                self.model_runner._dummy_run(size)
+
+            if not self.model_config.enforce_eager:
+                npugraph_memory_bytes = self.model_runner.capture_model()
+                self._restore_identity_elastic_info_after_capture()
+        finally:
+            finish_new_rank_capture_dp_sync()
 
         # Compare actual vs estimated ACL graph memory (if we did profiling)
         if hasattr(self, "npugraph_memory_estimate") and self.npugraph_memory_estimate > 0:

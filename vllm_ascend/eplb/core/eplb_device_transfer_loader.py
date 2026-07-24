@@ -17,11 +17,14 @@
 from enum import Enum
 
 import torch.distributed as dist
+import torch_npu
 from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
+from vllm_ascend.eplb.adaptor.vllm_adaptor import EPLB_EXPERT_WEIGHT_TRANSFER_AS_ND
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
 
 
 class ExpertWeightUpdateState(Enum):
@@ -62,7 +65,13 @@ class D2DExpertWeightLoader:
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
-            for src_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]:
+            expert_weight_key = self.eplb_adaptor.expert_weight_key_per_layer[layer_id]
+            transfer_as_nd = EPLB_EXPERT_WEIGHT_TRANSFER_AS_ND[expert_weight_key]
+            for src_tensor, needs_nd_transfer in zip(
+                self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id], transfer_as_nd
+            ):
+                if needs_nd_transfer:
+                    src_tensor = torch_npu.npu_format_cast(src_tensor, ACL_FORMAT_FRACTAL_ND)
                 self.comm_op_list.append(
                     dist.P2POp(
                         dist.isend, src_tensor, self.comm_group.ranks[dst_rank], group=self.comm_group.device_group
@@ -86,10 +95,23 @@ class D2DExpertWeightLoader:
     def set_log2phy_map(self, log2phy_map):
         self.updated_log2phy_map = log2phy_map
 
+    def _stage_log2phy_map_before_d2d(self):
+        if self.updated_log2phy_map is None or self.layer_id < 0:
+            return
+        target = self.eplb_adaptor.log2phy_map_per_layer[self.layer_id]
+        if target is None:
+            return
+        self.updated_log2phy_map = self.updated_log2phy_map.to(
+            device=target.device,
+            dtype=target.dtype,
+        )
+
     def asyn_expert_weight_transfer(self, reqs):
         # Only when send/recv tasks are parsed into self.comm_op_list, d2d send/recv tasks can be launched
         if self.state != ExpertWeightUpdateState.READY:
             return
+
+        self._stage_log2phy_map_before_d2d()
 
         # set asynchronous stream for d2d expert weight transfer
         if self.comm_op_list:
@@ -113,7 +135,20 @@ class D2DExpertWeightLoader:
             self.comm_op_list = None
 
         # update expert_map
-        self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)
+        current_expert_map = self.eplb_adaptor.global_expert_map_per_layer_cpu.get(
+            self.layer_id
+        )
+        if (
+            current_expert_map is None
+            or current_expert_map.shape != self.updated_expert_map.shape
+        ):
+            self.eplb_adaptor.do_clone_update_expert_map(
+                self.layer_id, self.updated_expert_map
+            )
+        else:
+            self.eplb_adaptor.do_update_expert_map(
+                self.layer_id, self.updated_expert_map
+            )
 
         # update log2phy_map
         self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)
