@@ -202,6 +202,40 @@ class TestNPUPlatform(TestBase):
         ):
             _validate_eplb_config(vllm_config)
 
+    def test_validate_eplb_config_sync_elastic_ep_selects_pynccl(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = True
+        vllm_config.parallel_config.eplb_config = MagicMock(
+            use_async=False,
+            communicator=None,
+        )
+
+        with patch.dict("os.environ", {}, clear=True):
+            _validate_eplb_config(vllm_config)
+
+        self.assertEqual(
+            vllm_config.parallel_config.eplb_config.communicator,
+            "pynccl",
+        )
+
+    def test_validate_eplb_config_rejects_pynccl_without_elastic_ep(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = False
+        vllm_config.parallel_config.eplb_config = MagicMock(
+            use_async=False,
+            communicator="pynccl",
+        )
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            self.assertRaisesRegex(ValueError, "torch_gloo"),
+        ):
+            _validate_eplb_config(vllm_config)
+
     def test_validate_eplb_config_async_rejects_nccl_communicator(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True

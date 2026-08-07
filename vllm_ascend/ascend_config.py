@@ -635,6 +635,7 @@ class AscendConfig:
         )
 
         self._validate_mc2_comm_alg(vc)
+        self._validate_elastic_ep(vc)
 
         # mega_moe_max_tokens range
         if self.mega_moe_max_tokens <= 0:
@@ -695,6 +696,22 @@ class AscendConfig:
             raise ValueError(
                 "fused mc2 op cannot be used with hierarchy communication. "
                 "Please set additional_config.enable_fused_mc2 to 0."
+            )
+
+    def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
+        if not vllm_config.parallel_config.enable_elastic_ep:
+            return
+
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("Elastic EP is only supported on A3.")
+
+        if self.eplb_config.dynamic_eplb:
+            raise ValueError(
+                "Elastic EP with dynamic_eplb=True is temporarily unsupported. "
+                "Set dynamic_eplb=False in eplb_config to use Elastic EP, or "
+                "use upstream EPLB with Model Runner V2 instead."
             )
 
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:

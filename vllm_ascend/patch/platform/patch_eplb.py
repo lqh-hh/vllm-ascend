@@ -9,9 +9,14 @@ from inspect import signature
 from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
+from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import logger
 
-from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
+from vllm_ascend.distributed.eplb.communicator import (
+    AscendGlooEplbCommunicator,
+    HcclEplbCommunicator,
+    PyHcclEplbCommunicator,
+)
 from vllm_ascend.distributed.eplb.state import (
     ASYNC_EPLB_CYCLE_COMMITTED_LOG,
     refresh_model_routing_tables,
@@ -65,15 +70,40 @@ def _patch_parallel_config() -> None:
 
 def _wrap_communicator_factory(original_factory):
     factory_signature = signature(original_factory)
-    if "group_coordinator" not in factory_signature.parameters:
-        raise RuntimeError("Unsupported vLLM EPLB contract: communicator factory has no group_coordinator parameter.")
+    required_parameters = {
+        "group_coordinator",
+        "backend",
+        "expert_weights",
+        "expert_buffer",
+    }
+    missing_parameters = required_parameters - factory_signature.parameters.keys()
+    if missing_parameters:
+        raise RuntimeError(
+            "Unsupported vLLM EPLB contract: communicator factory is missing "
+            f"required parameters: {', '.join(sorted(missing_parameters))}."
+        )
 
     @wraps(original_factory)
     def _create_eplb_communicator(*args, **kwargs):
         bound = factory_signature.bind(*args, **kwargs)
-        return AscendGlooEplbCommunicator(
-            cpu_group=bound.arguments["group_coordinator"].cpu_group,
-        )
+        bound.apply_defaults()
+        group_coordinator = bound.arguments["group_coordinator"]
+        backend = bound.arguments["backend"]
+        if isinstance(group_coordinator, StatelessGroupCoordinator) or backend == "pynccl":
+            device_comm = getattr(group_coordinator, "device_communicator", None)
+            pyhccl_comm = getattr(device_comm, "pyhccl_comm", None)
+            if pyhccl_comm is None or pyhccl_comm.disabled or not pyhccl_comm.available:
+                raise ValueError(
+                    "Elastic EP EPLB requires a PyHcclCommunicator on the "
+                    "stateless EPLB group's device communicator, but got "
+                    f"pyhccl_comm={pyhccl_comm}."
+                )
+            return PyHcclEplbCommunicator(pyhccl_comm=pyhccl_comm)
+        if backend == "torch_nccl" and _is_npu_platform(_parallel_config.current_platform):
+            return HcclEplbCommunicator(group_coordinator.device_group)
+        if backend == "torch_gloo":
+            return AscendGlooEplbCommunicator(cpu_group=group_coordinator.cpu_group)
+        return original_factory(*args, **kwargs)
 
     setattr(_create_eplb_communicator, _PATCH_MARKER, True)
     return _create_eplb_communicator
