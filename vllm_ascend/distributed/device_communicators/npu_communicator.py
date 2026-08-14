@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
+from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
+
 
 class _NpuAll2AllManager:
     """No-op all2all_manager for NPU. Used by vLLM main's fault-tolerance

@@ -11,35 +11,6 @@ from vllm.distributed.parallel_state import (
 from vllm_ascend.ascend_config import get_ascend_config
 
 
-def _init_ep_like_group(
-    group_ranks: list[list[int]],
-    group_name: str,
-    master_ip: str,
-    backend: str,
-    *,
-    coord_store=None,
-    enable_elastic_ep: bool = False,
-) -> GroupCoordinator:
-    """Create an EP-like communication group (mc2 / dynamic_eplb / fc3_quant_x).
-    When elastic EP is enabled, use stateless groups so new ranks can join
-    dynamically; otherwise use standard model parallel groups.
-    """
-    if enable_elastic_ep:
-        return _init_stateless_group(
-            group_ranks,
-            group_name,
-            master_ip,
-            backend,
-            coord_store=coord_store,
-        )
-    return init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        group_name=group_name,
-    )
-
-
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
 
@@ -135,23 +106,29 @@ def init_ascend_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
 
-    global _MC2, _DYNAMIC_EPLB
-    _MC2 = _init_ep_like_group(
-        group_ranks,
-        "mc2",
-        parallel_config.data_parallel_master_ip,
-        backend,
-        coord_store=coord_store,
-        enable_elastic_ep=enable_elastic_ep,
-    )
-    if get_ascend_config().eplb_config.dynamic_eplb:
-        _DYNAMIC_EPLB = _init_ep_like_group(
+    global _MC2
+    # The MC2 group must be stateless when elastic EP is enabled so that new
+    # ranks can join the topology dynamically during scaling.
+    if enable_elastic_ep:
+        _MC2 = _init_stateless_group(
             group_ranks,
-            "dynamic_eplb",
+            "mc2",
             parallel_config.data_parallel_master_ip,
             backend,
             coord_store=coord_store,
-            enable_elastic_ep=enable_elastic_ep,
+        )
+    else:
+        _MC2 = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="mc2",
+        )
+
+    if get_ascend_config().eplb_config.dynamic_eplb:
+        global _DYNAMIC_EPLB
+        _DYNAMIC_EPLB = init_model_parallel_group(
+            group_ranks, get_world_group().local_rank, backend, group_name="dynamic_eplb"
         )
 
     # Initialize fine-grained TP process groups on Ascend for four components:
@@ -199,18 +176,12 @@ def init_ascend_model_parallel(
 def _replace_ascend_active_groups(
     *,
     mc2: GroupCoordinator | None,
-    dynamic_eplb: GroupCoordinator | None,
 ) -> None:
-    """Destroy the current DP/EP/WORLD/EPLB groups and replace them.
-    Destruction is collective — all ranks in the old groups must call this
-    function together.  Pass all-``None`` to tear down without replacement.
-    """
-    global _MC2, _DYNAMIC_EPLB
-    for group in (_MC2, _DYNAMIC_EPLB):
-        if group is not None:
-            group.destroy()
+    """Replace the current MC2 group; all ranks must call this together."""
+    global _MC2
+    if _MC2 is not None:
+        _MC2.destroy()
     _MC2 = mc2
-    _DYNAMIC_EPLB = dynamic_eplb
 
 
 def model_parallel_initialized():

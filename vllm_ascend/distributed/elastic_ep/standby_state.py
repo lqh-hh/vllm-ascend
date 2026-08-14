@@ -1,5 +1,6 @@
 import torch
 from vllm.distributed.parallel_state import (
+    _init_stateless_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -7,11 +8,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.distributed.utils import get_cached_tcp_store_client
 
-from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.distributed.parallel_state import _init_ep_like_group
-
 _STANDBY_MC2: StatelessGroupCoordinator | None = None
-_STANDBY_DYNAMIC_EPLB: StatelessGroupCoordinator | None = None
 
 
 def create_ascend_standby_groups(
@@ -21,7 +18,7 @@ def create_ascend_standby_groups(
     coord_store_port: int,
     backend: str | None = None,
 ) -> None:
-    global _STANDBY_MC2, _STANDBY_DYNAMIC_EPLB
+    global _STANDBY_MC2
 
     assert new_world_size_across_dp == torch.distributed.get_world_size() * new_dp_size
     world_group = get_world_group()
@@ -37,34 +34,22 @@ def create_ascend_standby_groups(
     group_ranks = all_ranks.unbind(0)
     standby_ep_ranks = [x.tolist() for x in group_ranks]
 
-    config = get_ascend_config()
-    _STANDBY_MC2 = _init_ep_like_group(
+    # The standby MC2 group is always stateless: it is only built for elastic
+    # EP scaling, so new ranks must be able to join the topology dynamically.
+    _STANDBY_MC2 = _init_stateless_group(
         standby_ep_ranks,
         "mc2",
         master_ip,
         backend,
         coord_store=coord_store,
-        enable_elastic_ep=True,
     )
-    if config.eplb_config.dynamic_eplb:
-        _STANDBY_DYNAMIC_EPLB = _init_ep_like_group(
-            standby_ep_ranks,
-            "dynamic_eplb",
-            master_ip,
-            backend,
-            coord_store=coord_store,
-            enable_elastic_ep=True,
-        )
 
 
 def pop_ascend_standby_groups() -> dict:
     """Return all standby groups and clear the standby state."""
-    global _STANDBY_MC2, _STANDBY_DYNAMIC_EPLB
+    global _STANDBY_MC2
     result = dict(
         mc2=_STANDBY_MC2,
-        dynamic_eplb=_STANDBY_DYNAMIC_EPLB,
     )
     _STANDBY_MC2 = None
-    _STANDBY_DYNAMIC_EPLB = None
-    _STANDBY_FC3_QUANT_X = None
     return result

@@ -14,16 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Patch target: vllm.distributed.stateless_coordinator (and the
-# vllm.distributed.utils stateless process-group helpers it uses).
-#
-# On Ascend NPU:
-# 1. Replace CudaCommunicator with NPUCommunicator in the
-#    stateless_coordinator module so the coordinator constructs an
-#    HCCL-aware device communicator.
-# 2. Wrap the stateless process-group init/destroy helpers so HCCL
-#    process groups are registered into torch's global ``_world`` state,
-#    making them usable with the standard torch.distributed APIs.
+# Patch vllm.distributed.stateless_coordinator: use NPUCommunicator and
+# register HCCL stateless groups into torch's global ``_world``.
 
 import vllm.distributed.stateless_coordinator as _stateless_coordinator
 from torch.distributed import ProcessGroup, Store
@@ -34,17 +26,8 @@ _orig_stateless_init = _stateless_coordinator.stateless_init_torch_distributed_p
 _orig_stateless_destroy = _stateless_coordinator.stateless_destroy_torch_distributed_process_group
 
 
-# ---------------------------------------------------------------------------
-# Patch stateless_init_torch_distributed_process_group.
-#
-# The upstream helper creates a ProcessGroup without touching torch's
-# global state. torch.distributed collective APIs look the group up in
-# ``_world`` (``pg_map`` / ``pg_names`` / ``pg_group_ranks`` /
-# ``pg_backend_config``) by ProcessGroup object, so an unregistered group
-# cannot be used with those APIs. For the HCCL backend on Ascend, register
-# the newly created group into ``_world`` so the standard
-# torch.distributed collectives work on it.
-# ---------------------------------------------------------------------------
+# Register HCCL stateless groups into torch's ``_world`` on init so the
+# standard torch.distributed APIs can find them.
 def _ascend_stateless_init_pg(**kwargs) -> ProcessGroup | tuple[ProcessGroup, Store]:
     # Call the original helper first to create the stateless group.
     if kwargs.get("return_store", False):
@@ -77,13 +60,7 @@ def _ascend_stateless_init_pg(**kwargs) -> ProcessGroup | tuple[ProcessGroup, St
         return pg
 
 
-# ---------------------------------------------------------------------------
-# Patch stateless_destroy_torch_distributed_process_group.
-#
-# Mirror the registration above: after the original destroy, remove the
-# group from torch's global ``_world`` state so stale entries do not
-# accumulate (and an already-destroyed group is never reused).
-# ---------------------------------------------------------------------------
+# Mirror the registration above: drop the group from ``_world`` on destroy.
 def _ascend_stateless_destroy_pg(pg: ProcessGroup) -> None:
     _orig_stateless_destroy(pg)
 

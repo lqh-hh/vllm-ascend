@@ -1,7 +1,5 @@
-# NOTE: Adapted from vLLM's elastic_execute.py.
-# Key changes: CUDA→NPU/ACL, custom weight transfer for quantized weights,
-# simplified broadcast_expert_mapping, Ascend-specific comm groups (mc2/dynamic_eplb), and EPLB via eplb_manager.
-# ============================================================
+# Adapted from vLLM's elastic_execute.py with Ascend-specific changes:
+# NPU/ACL graphs, quantized weight transfer, MC2 comm groups, PyHccl EPLB.
 
 import gc
 import threading
@@ -20,6 +18,7 @@ from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
 from vllm.v1.attention.backend import AttentionImplBase
+from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
@@ -30,6 +29,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
 )
 from vllm_ascend.distributed.elastic_ep.standby_state import (
+    create_ascend_standby_groups,
     pop_ascend_standby_groups,
 )
 from vllm_ascend.distributed.parallel_state import (
@@ -49,6 +49,9 @@ def ascend_batch_transfer_weights(
     dp_group: StatelessGroupCoordinator,
     expert_weights: Sequence[Iterable[torch.Tensor]],
 ) -> None:
+    # Ascend HCCL P2P weight transfer. Replaces upstream batch_transfer_weights via
+    # monkey-patch. Differs from upstream: collects params from __dict__/AttentionImplBase,
+    # negotiates param names via TCP store, skips contiguous() (HCCL native support).
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
     if device_comm is None:
@@ -66,7 +69,6 @@ def ascend_batch_transfer_weights(
     all_params = []
     all_params_ptrs = set()
     all_params_name = []
-    expert_map_params = []
 
     for name, param in state_dict.items():
         if name.endswith("expert_map"):
@@ -120,9 +122,6 @@ def ascend_batch_transfer_weights(
 
     device_comm.batch_isend_irecv(p2p_ops)
 
-    for npu_tensor, cpu_tensor in expert_map_params:
-        cpu_tensor.copy_(npu_tensor)
-
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
     if isinstance(
@@ -140,15 +139,28 @@ def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
 
 
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
-    def __init__(self, worker):
-        super().__init__(worker)
-
     @contextmanager
     def _use_ascend_transfer_impl(self):
         with patch(
             "vllm.distributed.elastic_ep.elastic_execute.batch_transfer_weights", new=ascend_batch_transfer_weights
         ):
             yield
+
+    def create_standby_groups(
+        self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
+    ) -> None:
+        # Reuse the upstream implementation to build the world / dp / ep / eplb
+        # standby groups, then create the Ascend-specific MC2 standby group.
+        super().create_standby_groups(reconfig_request, use_all2all)
+        create_ascend_standby_groups(
+            new_dp_size=reconfig_request.new_data_parallel_size,
+            new_world_size_across_dp=(
+                self.worker.vllm_config.parallel_config.world_size
+                * reconfig_request.new_data_parallel_size
+            ),
+            master_ip=reconfig_request.new_data_parallel_master_ip,
+            coord_store_port=reconfig_request.coord_store_port,
+        )
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
@@ -170,17 +182,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if mgr is not None:
             mgr.graphs.clear()
             mgr._graphs_captured = False
-            # The NPU graph pool caches allocations from previously
-            # captured graphs; a fresh pool is required before re-capture
-            # or the allocator asserts "it->second->use_count > 0"
-            # (NPUCachingAllocator.cpp:2106).
+            # NPU graph pools cache old allocations; a fresh pool is
+            # required before re-capture (NPUCachingAllocator.cpp:2106).
             mgr.pool = current_platform.graph_pool_handle()
-        if mgr is not None and hasattr(mgr, "capture_sizes"):
-            capture_sizes = mgr.capture_sizes
-            if self.worker.model_runner.use_aclgraph:
-                set_graph_params(capture_sizes)
-                if self.worker.model_runner.speculative_config:
-                    set_draft_graph_params(capture_sizes)
+            if hasattr(mgr, "capture_sizes"):
+                capture_sizes = mgr.capture_sizes
+                if self.worker.model_runner.use_aclgraph:
+                    set_graph_params(capture_sizes)
+                    if self.worker.model_runner.speculative_config:
+                        set_draft_graph_params(capture_sizes)
 
         gc.collect()
         torch.npu.synchronize()
@@ -188,7 +198,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def switch_and_remove(self) -> None:
         super().switch_and_remove()
-        _replace_ascend_active_groups(mc2=None, dynamic_eplb=None)
+        _replace_ascend_active_groups(mc2=None)
 
     def switch_and_prepare(self) -> None:
         super().switch_and_prepare()
@@ -201,38 +211,26 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             module.moe_config.dp_group = get_dp_group()
             module.moe_config.ep_group = get_ep_group()
             module.moe_config.mc2_group = get_mc2_group()
-
-    def commit_scale_up(self, is_existing_worker: bool) -> None:
-        if is_existing_worker:
-            self.broadcast_expert_mapping()
-            self.switch_and_prepare()
-        else:
-            mapping, _, num_valid_experts = self.receive_expert_mapping()
-            self.worker.model_runner.setup_eplb_from_mapping(mapping, num_valid_experts)
         self._setup_moe_comm_and_quant_method()
-        self._perform_eplb_reshuffle()
-        self.warm_and_capture()
 
-    def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
-        self.perform_scale_down_eplb_reshuffle(new_dp_size)
-        if removing:
-            self.switch_and_remove()
-        else:
-            self.switch_and_prepare()
-            self._setup_moe_comm_and_quant_method()
-            self.warm_and_capture()
+    def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
+        mapping, num_logical_experts, num_valid_experts = super().receive_expert_mapping()
+        self._setup_moe_comm_and_quant_method()
+        return mapping, num_logical_experts, num_valid_experts
 
     def receive_weights(self) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
             super().receive_weights()
 
-    def prepare_new_worker(self) -> None:
-        pass
-
     def warmup_local_kernels(self) -> None:
         pass
 
     def warm_and_capture(self) -> None:
+        # No need to save/clear/restore the KV-cache block tables like the
+        # upstream warm_and_capture: the V2 runner's dummy attention uses
+        # all-zero block tables (reserved null block) and PAD_SLOT_ID slot
+        # mappings, so real KV-cache blocks are never written during the
+        # dummy run.
         runner = self.worker.model_runner
         self._release_cuda_graphs()
         unlock_workspace()

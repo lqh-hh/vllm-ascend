@@ -165,7 +165,7 @@ class HCCLLibrary:
         # HcclResult HcclSend(
         #   void *buf, uint64_t count,
         #   HcclDataType dataType, uint32_t root,
-        #   HcclComm comm, aclrtStream steam);
+        #   HcclComm comm, aclrtStream stream);
         Function(
             "HcclSend",
             hcclResult_t,
@@ -181,7 +181,7 @@ class HCCLLibrary:
         # HcclResult HcclRecv(
         #   void *buf, uint64_t count,
         #   HcclDataType dataType, uint32_t root,
-        #   HcclComm comm, aclrtStream steam);
+        #   HcclComm comm, aclrtStream stream);
         Function(
             "HcclRecv",
             hcclResult_t,
@@ -319,11 +319,11 @@ class HCCLLibrary:
         sendbuff: buffer_type,
         count: int,
         datatype: int,
-        dest: int,
+        src: int,
         comm: hcclComm_t,
         stream: aclrtStream_t,
     ) -> None:
-        self.HCCL_CHECK(self._funcs["HcclRecv"](sendbuff, count, datatype, dest, comm, stream))
+        self.HCCL_CHECK(self._funcs["HcclRecv"](sendbuff, count, datatype, src, comm, stream))
 
     def hcclBroadcast(
         self, buf: buffer_type, count: int, datatype: int, root: int, comm: hcclComm_t, stream: aclrtStream_t
