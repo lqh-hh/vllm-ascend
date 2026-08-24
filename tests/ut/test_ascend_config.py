@@ -954,7 +954,7 @@ class TestUpstreamConfigCompatibility(TestBase):
             enable_mc2_hierarchy_comm=False,
         )
         vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+            parallel_config=SimpleNamespace(enable_elastic_ep=True, enable_fault_tolerance=False),
         )
 
         with self.assertRaisesRegex(ValueError, "Elastic EP is only supported on A3"):
@@ -967,7 +967,7 @@ class TestUpstreamConfigCompatibility(TestBase):
             eplb_config=EplbConfig(dynamic_eplb=True),
         )
         vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+            parallel_config=SimpleNamespace(enable_elastic_ep=True, enable_fault_tolerance=False),
         )
 
         with self.assertRaisesRegex(ValueError, "dynamic_eplb=True"):
@@ -979,10 +979,21 @@ class TestUpstreamConfigCompatibility(TestBase):
             sparse_kv_offload_config=SimpleNamespace(enabled=False),
         )
         vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+            parallel_config=SimpleNamespace(enable_elastic_ep=True, enable_fault_tolerance=False),
         )
 
         config._validate_elastic_ep(vllm_config)
+
+    def test_elastic_ep_rejects_fault_tolerance_scale_down(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        )
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_elastic_ep=True, enable_fault_tolerance=True),
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot be enabled together"):
+            config._validate_elastic_ep(vllm_config)
 
 
 class TestTopLevelSwitchTypeValidation(TestBase):
@@ -1032,6 +1043,7 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             "enable_mlapo": "false",
             "msmonitor_use_daemon": "false",
             "enable_transpose_kv_cache_by_block": "false",
+            "ft_communication_ops_abort_timeout_ms": "15",
             "weight_nz_mode": "2",
         }
 
@@ -1041,7 +1053,17 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         self.assertFalse(config.enable_mlapo)
         self.assertFalse(config.msmonitor_use_daemon)
         self.assertFalse(config.enable_transpose_kv_cache_by_block)
+        self.assertEqual(config.ft_communication_ops_abort_timeout_ms, 15)
         self.assertEqual(config.weight_nz_mode, 2)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ft_communication_timeout_rejects_negative_value(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"ft_communication_ops_abort_timeout_ms": -1}
+
+        with self.assertRaisesRegex(ValueError, "must be a non-negative integer"):
+            init_ascend_config(vc)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

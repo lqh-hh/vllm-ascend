@@ -263,6 +263,7 @@ class AscendConfig:
     mlapo_keep_prefill_weights: bool = False
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
+    ft_communication_ops_abort_timeout_ms: int = 0
     weight_nz_mode: int = 1
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
@@ -307,6 +308,7 @@ class AscendConfig:
         _A_FAMILY = {
             "enable_mlapo": "VLLM_ASCEND_ENABLE_MLAPO",
             "enable_transpose_kv_cache_by_block": "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK",
+            "ft_communication_ops_abort_timeout_ms": "VLLM_ASCEND_FT_COMMUNICATION_OPS_ABORT_TIMEOUT_MS",
             "weight_nz_mode": "VLLM_ASCEND_ENABLE_NZ",
         }
         for key, env_name in _A_FAMILY.items():
@@ -326,6 +328,11 @@ class AscendConfig:
     def _validate_user_input_ranges(self):
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
+        if self.ft_communication_ops_abort_timeout_ms < 0:
+            raise ValueError(
+                "ft_communication_ops_abort_timeout_ms must be a non-negative "
+                f"integer, got {self.ft_communication_ops_abort_timeout_ms}"
+            )
         return self
 
     # ---- derivations + cross-config downgrades/mutex ----
@@ -555,7 +562,15 @@ class AscendConfig:
             )
 
     def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
-        if not vllm_config.parallel_config.enable_elastic_ep:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep and parallel_config.enable_fault_tolerance:
+            raise ValueError(
+                "Elastic EP and fault-tolerance scale-down cannot be enabled "
+                "together. Elastic EP rebuilds MC2 groups, while fault-tolerance "
+                "scale-down preserves the original rank coordinates."
+            )
+
+        if not parallel_config.enable_elastic_ep:
             return
 
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type

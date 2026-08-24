@@ -3,7 +3,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from tests.ut.base import TestBase
-from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
+from vllm_ascend.distributed.device_communicators.npu_communicator import (
+    NPUCommunicator,
+    _NpuAll2AllManager,
+)
 
 
 class TestNPUCommunicator(TestBase):
@@ -113,3 +116,23 @@ class TestNPUCommunicator(TestBase):
 
         communicator.pyhccl_comm.broadcast.assert_called_once_with(tensor, 1)
         self.assertIs(result, tensor)
+
+    def test_all2all_manager_builds_dense_rank_tables_in_place(self):
+        manager = _NpuAll2AllManager(4, torch.device("cpu"))
+        manager.set_num_physical_experts(12)
+        manager.update_mask(1)
+
+        self.assertEqual(manager.query_active_mask().tolist(), [0, 1, 0, 0])
+        elastic_info = manager.get_elastic_info()
+        self.assertEqual(
+            elastic_info.tolist(),
+            [1, 3, 0, 12, 0, -1, 1, 2, 0, 2, 3, -1],
+        )
+
+        data_ptr = elastic_info.data_ptr()
+        manager.update_mask(2)
+        self.assertEqual(manager.get_elastic_info().data_ptr(), data_ptr)
+        self.assertEqual(
+            manager.get_elastic_info().tolist(),
+            [1, 2, 0, 12, 0, -1, -1, 1, 0, 3, -1, -1],
+        )

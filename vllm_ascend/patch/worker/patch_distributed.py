@@ -131,6 +131,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.group_name = group_name
         self.group_ranks = group_ranks
 
+        # Mirrors upstream GroupCoordinator.__init__ for FT scale-down. The DP
+        # synchronization path reads this set to neutralize dead-rank columns.
+        self.dead_dp_ranks: set[int] = set()
+
         try:
             self._init_device_groups(create_cpu_group=True)
             assert self.cpu_group is not None
@@ -154,6 +158,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             raise
 
     def _init_device_groups(self, create_cpu_group: bool) -> None:
+        from torch.distributed.distributed_c10d import _set_pg_timeout
+        from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
+
+        timeout = get_cpu_distributed_timeout_or_none()
         reuse_domain = _resolve_reuse_domain(self.group_name)
         self_device_group = None
         for ranks in self.group_ranks:
@@ -176,19 +184,22 @@ class GroupCoordinatorPatch(GroupCoordinator):
                     self.world_size = len(ranks)
                     self.rank_in_group = ranks.index(self.rank)
                     self.cpu_group = cpu_group
+                    if timeout is not None:
+                        _set_pg_timeout(timeout=timeout, group=cpu_group)
                 self_device_group = device_group
 
         if self_device_group is not None:
             self.device_group = self_device_group
 
     def _init_device_communicator(self) -> None:
-        self.device = torch.npu.current_device()
+        self.device = torch.device(f"npu:{torch.npu.current_device()}")
         if self.use_device_communicator and self.world_size > 1:
             self.device_communicator = NPUCommunicator(
                 cpu_group=self.cpu_group,
                 device=self.device,
                 device_group=self.device_group,
                 unique_name=self.unique_name,
+                use_all2all=self.use_all2all,
             )
 
     def _release_hccl_resources(self) -> bool:
