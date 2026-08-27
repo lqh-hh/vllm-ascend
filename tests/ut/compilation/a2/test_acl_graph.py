@@ -153,7 +153,7 @@ class TestACLGraphWrapper(TestBase):
     def test_initialization_with_default_options(self, mock_envs, mock_current_platform):
         """Test ACLGraphWrapper initialization with default CUDAGraphOptions"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
 
         wrapper = ACLGraphWrapper(
             runnable=self.mock_runnable, vllm_config=self.mock_vllm_config, runtime_mode=CUDAGraphMode.FULL
@@ -172,7 +172,7 @@ class TestACLGraphWrapper(TestBase):
     def test_initialization_with_custom_options(self, mock_envs, mock_current_platform):
         """Test ACLGraphWrapper initialization with custom CUDAGraphOptions"""
         mock_envs.VLLM_LOGGING_LEVEL = "DEBUG"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
 
         wrapper = ACLGraphWrapper(
             runnable=self.mock_runnable,
@@ -194,7 +194,7 @@ class TestACLGraphWrapper(TestBase):
     def test_initialization_assertion_error(self, mock_envs, mock_current_platform):
         """Test ACLGraphWrapper initialization raises AssertionError for NONE mode"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
 
         with self.assertRaises(AssertionError):
             ACLGraphWrapper(
@@ -210,7 +210,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method when runtime mode is NONE"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
 
@@ -236,7 +236,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method when runtime mode doesn't match wrapper mode"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE  # Different from FULL
@@ -275,7 +275,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method captures graph for the first time"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
@@ -351,7 +351,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method replays graph when already captured"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
 
@@ -431,7 +431,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method with debug mode input address checking"""
         mock_envs.VLLM_LOGGING_LEVEL = "DEBUG"  # Enable debug mode
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
@@ -493,7 +493,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method with debug mode input address mismatch raises AssertionError"""
         mock_envs.VLLM_LOGGING_LEVEL = "DEBUG"  # Enable debug mode
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
@@ -560,7 +560,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method captures graph with gc_disable option enabled"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
@@ -640,7 +640,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method captures graph with weak_ref_output option enabled"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
@@ -703,7 +703,7 @@ class TestACLGraphWrapper(TestBase):
     ):
         """Test __call__ method captures graph with debug logging enabled"""
         mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_current_platform.graph_pool_handle.return_value = self.mock_graph_pool
         mock_get_forward_context.return_value = self.mock_forward_context
         mock_get_forward_context_2.return_value = self.mock_forward_context
         self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL

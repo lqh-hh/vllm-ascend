@@ -1294,6 +1294,42 @@ def test_set_lora_context_updates_experts(has_shared_experts):
         shared_experts.set_lora_context.assert_called_once_with(lora_context)
 
 
+def test_scale_up_runner_defers_mc2_group(monkeypatch):
+    moe_config = SimpleNamespace(hidden_dim=8, ep_size=4)
+    router = object()
+    routed_experts = SimpleNamespace(quant_type=QuantType.NONE, router=None)
+
+    def mock_parent_init(self, _layer_name, parent_moe_config, _router, parent_routed_experts, *_args):
+        nn.Module.__init__(self)
+        self.moe_config = parent_moe_config
+        self.routed_experts = parent_routed_experts
+
+    get_mc2_group = MagicMock()
+    setup_moe_comm_method = MagicMock()
+    monkeypatch.setattr(fused_moe_module.MoERunner, "__init__", mock_parent_init)
+    monkeypatch.setattr(fused_moe_module, "get_tp_group", MagicMock(return_value="tp"))
+    monkeypatch.setattr(fused_moe_module, "get_dp_group", MagicMock(return_value="dp"))
+    monkeypatch.setattr(fused_moe_module, "get_ep_group", MagicMock(return_value="ep"))
+    monkeypatch.setattr(fused_moe_module, "get_mc2_group", get_mc2_group)
+    monkeypatch.setattr(fused_moe_module, "setup_moe_comm_method", setup_moe_comm_method)
+    monkeypatch.setattr(fused_moe_module, "get_moe_comm_method", MagicMock(return_value=None))
+    monkeypatch.setattr(fused_moe_module.envs, "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", True)
+
+    AscendMoERunner(
+        "model.layers.0.mlp",
+        moe_config,
+        router,
+        routed_experts,
+    )
+
+    assert moe_config.tp_group == "tp"
+    assert moe_config.dp_group == "dp"
+    assert moe_config.ep_group == "ep"
+    assert getattr(moe_config, "mc2_group", None) is None
+    get_mc2_group.assert_not_called()
+    setup_moe_comm_method.assert_not_called()
+
+
 @pytest.mark.parametrize("has_shared_experts", [False, True])
 def test_forward_impl_returns_current_runner_contract(monkeypatch, has_shared_experts):
     runner = AscendMoERunner.__new__(AscendMoERunner)

@@ -560,14 +560,68 @@
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
 #
-#   2. `vllm.config.vllm.VllmConfig._get_v2_model_runner_unsupported_features`
+#   2. `vllm.config.vllm.VllmConfig._validate_v2_model_runner`
 #    Why:
-#       Ascend V2 runner supports elastic EP, which upstream lists as
-#       unsupported (vllm/config/vllm.py). Drop it from the returned list.
+#       Upstream validation rejects Elastic EP because the CUDA V2 runner does
+#       not support it, while the Ascend V2 runner provides its own Elastic EP
+#       implementation.
+#    How:
+#       Temporarily hide only `parallel_config.enable_elastic_ep` while calling
+#       the original validator, then restore it even when validation fails.
+#       Every other upstream V2 validation remains active.
 #    Related PR (if no, explain why):
-#       No, NPU V2 model runner supports elastic EP.
+#       No, this is specific to Ascend's Elastic EP V2 implementation.
 #    Future Plan:
-#       Remove when upstream V2 runner supports elastic EP on non-CUDA backends.
+#       Remove when upstream supports backend-specific V2 feature validation.
+#
+# ** 23. File: platform/patch_stateless_coordinator.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.utils.stateless_init_torch_distributed_process_group`
+#      `vllm.distributed.utils.stateless_destroy_torch_distributed_process_group`
+#    Why:
+#       Stateless HCCL groups are not registered in torch's global `_world`,
+#       so torch.distributed APIs cannot resolve them on Ascend.
+#    How:
+#       Register HCCL groups on creation and remove their registrations on
+#       destruction.
+#    Related PR (if no, explain why):
+#       No, this is NPU-specific HCCL stateless process-group registration.
+#    Future Plan:
+#       Remove if upstream registers out-of-tree stateless groups itself.
+#   2. `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#    Why:
+#       The verified upstream stateless coordinator retains a CUDA communicator
+#       binding; Ascend requires the HCCL-aware `NPUCommunicator`.
+#    How:
+#       Replace the module-local communicator binding with `NPUCommunicator`.
+#    Related PR (if no, explain why):
+#       No, this is an Ascend backend selection requirement.
+#    Future Plan:
+#       Remove when the upstream coordinator resolves the platform communicator
+#       without retaining a CUDA-specific binding.
+#   3. `vllm.distributed.stateless_coordinator.StatelessGroupCoordinator.broadcast`
+#    Why:
+#       Upstream routes only CUDA tensors through the device communicator.
+#    How:
+#       Route NPU tensors through the HCCL-aware `NPUCommunicator` as well.
+#    Related PR (if no, explain why):
+#       No, this is an out-of-tree NPU device-type adaptation.
+#    Future Plan:
+#       Remove when upstream uses a platform-generic device-tensor check.
+#   4. `vllm.distributed.stateless_coordinator.StatelessGroupCoordinator.__init__`
+#    Why:
+#       Ray DP workers can all have logical `local_rank == 0` while running on
+#       different physical NPUs. Upstream copies that logical index into the
+#       stateless coordinator, causing Elastic EP warmup tensors and lazy HCCL
+#       communicators to be created on physical NPU 0 for multiple ranks.
+#    How:
+#       After upstream initialization, bind the coordinator's device index and
+#       device to the NPU already selected in the Elastic EP async thread.
+#    Related PR (if no, explain why):
+#       No, this is an out-of-tree Ray/HCCL device-mapping adaptation.
+#    Future Plan:
+#       Remove when upstream stateless groups use the active out-of-tree device
+#       instead of inheriting a logical WORLD-group index.
 #
 # * Worker Patch:
 # ===============

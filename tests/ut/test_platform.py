@@ -99,6 +99,16 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.ray_device_key, "NPU")
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
 
+    def test_stateless_process_group_rejects_non_hccl_backend(self):
+        with self.assertRaisesRegex(ValueError, "require HCCL"):
+            NPUPlatform.stateless_init_device_torch_dist_pg(
+                backend="gloo",
+                prefix_store=MagicMock(),
+                group_rank=0,
+                group_size=1,
+                timeout=MagicMock(),
+            )
+
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
     @patch("vllm_ascend.platform.enable_sfa_dcp_replicated_indexer", return_value=True)
     @patch("vllm_ascend.platform.model_uses_sfa_sparse", return_value=True)

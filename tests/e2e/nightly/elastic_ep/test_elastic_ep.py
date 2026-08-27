@@ -38,10 +38,10 @@ from tests.e2e.conftest import RemoteOpenAIServer
 # Server / model constants
 # ---------------------------------------------------------------------------
 
-QWEN3_30B_A3B_MODEL = "Qwen/Qwen3-30B-A3B"
+QWEN3_30B_A3B_MODEL = os.getenv("MODEL_NAME", "Qwen/Qwen3-30B-A3B")
 """HuggingFace / ModelScope identifier of the MoE model used for testing."""
 
-DATASET_NAME = "vllm-ascend/gsm8k-lite"
+DATASET_NAME = os.getenv("DATASET_PATH", "vllm-ascend/gsm8k-lite")
 """HuggingFace / ModelScope identifier of the accuracy-evaluation dataset."""
 
 MAX_MODEL_LEN = 16384
@@ -68,13 +68,45 @@ def cleanup_ray_between_tests():
     subprocess.run(["ray", "stop", "--force"], timeout=30, capture_output=True)
     time.sleep(5)
 
+    # Do not let a stale address from an earlier cluster make ``ray start``
+    # reconnect to a GCS process that the fixture just stopped.
+    os.environ.pop("RAY_ADDRESS", None)
+
     env_dict = _make_env_dict()
     for key, value in env_dict.items():
         os.environ[key] = value
 
-    subprocess.run(["ray", "start", "--head"], timeout=30, capture_output=True)
+    try:
+        ray_start = subprocess.run(
+            [
+                "ray",
+                "start",
+                "--head",
+                "--port=0",
+                "--include-dashboard=true",
+                "--disable-usage-stats",
+            ],
+            timeout=60,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            "Timed out while starting the Ray head node with a random GCS port.\n"
+            f"stdout:\n{exc.stdout or ''}\n"
+            f"stderr:\n{exc.stderr or ''}"
+        )
+    if ray_start.returncode != 0:
+        pytest.fail(
+            "Failed to start the Ray head node with a random GCS port.\n"
+            f"stdout:\n{ray_start.stdout}\n"
+            f"stderr:\n{ray_start.stderr}"
+        )
     time.sleep(5)
-    yield
+    try:
+        yield
+    finally:
+        subprocess.run(["ray", "stop", "--force"], timeout=30, capture_output=True)
 
 
 def _send_scale_command(server, new_dp_size: int) -> bool:
@@ -263,7 +295,7 @@ def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
             print(f"  {stage_description} accuracy: {accuracies[stage_description]:.2f}")
 
         # Print summary
-        print(f"nElastic EP Accuracy Summary ({config.name}):")
+        print(f"\nElastic EP Accuracy Summary ({config.name}):")
         for stage, acc in accuracies.items():
             print(f"  {stage}: {acc:.2f}")
         print(f"  Baseline: {GSM8K_BASELINE:.2f} +/- {GSM8K_THRESHOLD:.2f}")

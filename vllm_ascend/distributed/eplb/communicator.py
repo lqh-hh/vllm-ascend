@@ -87,6 +87,4 @@ class PyHcclEplbCommunicator(EplbCommunicator):
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
-        # Ascend experts live in independent tensors; reserve HCCL buffers
-        # during actual P2P transfers, not during profiling.
         return False

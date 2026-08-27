@@ -1,18 +1,24 @@
 import torch
+import vllm.envs as envs
 from vllm.config import ParallelConfig, get_current_vllm_config
-from vllm.distributed import get_cached_tcp_store_client
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _init_stateless_group,
     get_world_group,
     init_model_parallel_group,
 )
+from vllm.distributed.utils import get_cached_tcp_store_client
 
 from vllm_ascend.ascend_config import get_ascend_config
 
-
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
+
+# MC2 is intentionally absent while a newly launched elastic-EP worker is
+# loading. Keep initialization state separate from the active MC2 group so the
+# remaining Ascend process groups are not initialized twice before the standby
+# MC2 group is installed during reconfiguration.
+_ASCEND_MODEL_PARALLEL_INITIALIZED = False
 
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
@@ -81,10 +87,11 @@ def init_ascend_model_parallel(
                 else global_dp_size * global_pp_size * global_pcp_size
             )
             group_ranks = ranks_base.clone().view(reshape_dim, -1, num_head_replica)
+            group_ranks = group_ranks.permute(0, 2, 1)
             group_ranks = group_ranks.reshape(-1, group_ranks.size(-1))  # [DP_size * num_head_replica, num_head]
             alltoall_group_size = group_ranks.size(-1) // remote_tp_size
             group_ranks = group_ranks.unsqueeze(-1).view(
-                global_dp_size * global_pp_size * global_pcp_size,
+                reshape_dim,
                 num_head_replica,
                 -1,
                 alltoall_group_size,
@@ -106,17 +113,23 @@ def init_ascend_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
 
-    global _MC2
+    global _ASCEND_MODEL_PARALLEL_INITIALIZED, _MC2
     # The MC2 group must be stateless when elastic EP is enabled so that new
     # ranks can join the topology dynamically during scaling.
     if enable_elastic_ep:
-        _MC2 = _init_stateless_group(
-            group_ranks,
-            "mc2",
-            parallel_config.data_parallel_master_ip,
-            backend,
-            coord_store=coord_store,
-        )
+        # A scale-up worker starts before the existing workers enter the
+        # reconfiguration RPC. Creating the final MC2 group here would make the
+        # new non-root rank wait for ports that the existing root rank cannot
+        # publish yet, deadlocking worker initialization. All ranks create the
+        # standby MC2 group together in prepare_reconfiguration instead.
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            _MC2 = _init_stateless_group(
+                group_ranks,
+                "mc2",
+                parallel_config.data_parallel_master_ip,
+                backend,
+                coord_store=coord_store,
+            )
     else:
         _MC2 = init_model_parallel_group(
             group_ranks,
@@ -172,6 +185,8 @@ def init_ascend_model_parallel(
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
 
+    _ASCEND_MODEL_PARALLEL_INITIALIZED = True
+
 
 def _replace_ascend_active_groups(
     *,
@@ -185,7 +200,7 @@ def _replace_ascend_active_groups(
 
 
 def model_parallel_initialized():
-    return _MC2 is not None
+    return _ASCEND_MODEL_PARALLEL_INITIALIZED
 
 
 def get_mc2_group() -> GroupCoordinator:
@@ -224,7 +239,7 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
 
 
 def destroy_ascend_model_parallel():
-    global _MC2
+    global _ASCEND_MODEL_PARALLEL_INITIALIZED, _MC2
     if _MC2:
         _MC2.destroy()
     _MC2 = None
@@ -258,6 +273,8 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+    _ASCEND_MODEL_PARALLEL_INITIALIZED = False
 
 
 def get_global_rank(parallel_config: ParallelConfig | None = None) -> int:

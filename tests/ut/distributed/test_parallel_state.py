@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import ParallelConfig
 
+import vllm_ascend.distributed.parallel_state as parallel_state_module
 from vllm_ascend.distributed.parallel_state import (
     _LMTP,
     _MC2,
@@ -16,6 +17,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_otp_group,
     get_p_tp_group,
     init_ascend_model_parallel,
+    model_parallel_initialized,
 )
 
 
@@ -76,6 +78,65 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         assert _LMTP is None
         assert _OTP is None
         assert _P_TP is None
+
+
+def test_scale_up_worker_defers_mc2_initialization():
+    parallel_config = SimpleNamespace(
+        enable_elastic_ep=True,
+        tensor_parallel_size=1,
+        data_parallel_size=4,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        data_parallel_master_ip="127.0.0.1",
+        _coord_store_port=12345,
+    )
+    finegrained_tp_config = SimpleNamespace(
+        oproj_tensor_parallel_size=0,
+        lmhead_tensor_parallel_size=0,
+        embedding_tensor_parallel_size=0,
+        mlp_tensor_parallel_size=0,
+    )
+    ascend_config = SimpleNamespace(
+        pd_tp_ratio=1,
+        pd_head_ratio=1,
+        eplb_config=SimpleNamespace(dynamic_eplb=False),
+        finegrained_tp_config=finegrained_tp_config,
+    )
+    world_group = SimpleNamespace(world_size=4, local_rank=3)
+
+    with (
+        patch.object(parallel_state_module, "_ASCEND_MODEL_PARALLEL_INITIALIZED", False),
+        patch.object(parallel_state_module, "_MC2", None),
+        patch.object(parallel_state_module, "_P_TP", None),
+        patch.object(parallel_state_module.envs, "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", True),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch(
+            "vllm_ascend.distributed.parallel_state.get_cached_tcp_store_client",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "vllm_ascend.distributed.parallel_state.get_world_group",
+            return_value=world_group,
+        ),
+        patch(
+            "vllm_ascend.distributed.parallel_state.get_ascend_config",
+            return_value=ascend_config,
+        ),
+        patch("vllm_ascend.distributed.parallel_state._init_stateless_group") as init_stateless_group,
+        patch("vllm_ascend.distributed.parallel_state.init_model_parallel_group") as init_group,
+    ):
+        init_ascend_model_parallel(parallel_config)
+
+        assert model_parallel_initialized()
+        assert parallel_state_module._MC2 is None
+        init_stateless_group.assert_not_called()
+        init_group.assert_not_called()
+
+        # MC2 being absent must not cause the other Ascend groups to be
+        # initialized a second time before reconfiguration installs it.
+        init_ascend_model_parallel(parallel_config)
+        init_stateless_group.assert_not_called()
+        init_group.assert_not_called()
 
 
 def _build_parallel_config(

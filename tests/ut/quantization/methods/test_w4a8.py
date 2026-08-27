@@ -5,6 +5,7 @@ import torch
 
 from tests.ut.base import TestBase
 from tests.ut.quantization.conftest_quantization import identity
+from vllm_ascend.quantization.methods.w4a8 import w4a8 as w4a8_module
 from vllm_ascend.quantization.methods.w4a8.w4a8 import AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD
 
@@ -55,6 +56,23 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         mock_tp_size.return_value = 32
         with self.assertRaisesRegex(ValueError, "tp>16"):
             AscendW4A8DynamicFusedMoEMethod()
+
+    def test_scale_up_init_defers_mc2_group_name(self):
+        mock_vllm_config = Mock()
+        mock_vllm_config.quant_config = Mock(quant_description={"group_size": 0})
+        mock_vllm_config.quant_config.get_name.return_value = ASCEND_QUANTIZATION_METHOD
+        mock_vllm_config.parallel_config = Mock(enable_expert_parallel=True, enable_eplb=True)
+        mock_vllm_config.use_v2_model_runner = True
+
+        with (
+            patch.object(w4a8_module.envs, "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", True),
+            patch.object(w4a8_module, "get_current_vllm_config", return_value=mock_vllm_config),
+            patch.object(w4a8_module, "get_mc2_group") as get_mc2_group,
+        ):
+            quant_method = AscendW4A8DynamicFusedMoEMethod()
+
+        self.assertEqual(quant_method.moe_all_to_all_group_name, "")
+        get_mc2_group.assert_not_called()
 
     def test_get_weight(self):
         param_dict = self.quant_method.get_weight(self.experts, self.input_size, self.output_size, torch.bfloat16)
