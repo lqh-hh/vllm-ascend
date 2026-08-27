@@ -45,4 +45,5 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 import vllm_ascend.patch.platform.patch_eplb  # noqa
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+import vllm_ascend.patch.platform.patch_stateless_coordinator  # noqa
 import vllm_ascend.patch.platform.patch_vision  # noqa

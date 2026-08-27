@@ -1,6 +1,7 @@
 import importlib
+import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -44,6 +45,7 @@ class TestNPUPlatform(TestBase):
         mock_vllm_config.parallel_config.nnodes_within_dp = 1
         mock_vllm_config.use_v2_model_runner = False
         mock_vllm_config.parallel_config.enable_eplb = False
+        mock_vllm_config.parallel_config.enable_elastic_ep = False
         mock_vllm_config.parallel_config.eplb_config = MagicMock(use_async=False, communicator=None)
         mock_vllm_config.cache_config = MagicMock()
         mock_vllm_config.scheduler_config = MagicMock()
@@ -57,6 +59,67 @@ class TestNPUPlatform(TestBase):
         mock_vllm_config.compilation_config.pass_config.enable_sp = False
         mock_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         return mock_vllm_config
+
+    def test_stateless_hccl_process_group_uses_platform_backend(self):
+        from vllm_ascend import platform
+
+        prefix_store = MagicMock()
+        group_store = MagicMock()
+        process_group = MagicMock()
+        process_group.get_group_store.return_value = group_store
+        process_group_cls = MagicMock(return_value=process_group)
+        backend_type = process_group_cls.BackendType.CUSTOM
+        backend_options = SimpleNamespace(_timeout=None, _device=None, group_id=None)
+        hccl_backend = MagicMock()
+
+        def create_hccl_backend(_store, _rank, _size, options):
+            group_store.set.assert_called_once_with("hccl_comm_name", "hccl-name")
+            self.assertEqual(options.group_id, "hccl-name")
+            return hccl_backend
+
+        process_group_hccl = MagicMock(side_effect=create_hccl_backend)
+        process_group_hccl.Options.return_value = backend_options
+        backend_device = MagicMock()
+        comm_device = MagicMock()
+        device_factory = MagicMock(side_effect=[backend_device, comm_device])
+
+        with (
+            patch.object(platform, "ProcessGroup", process_group_cls),
+            patch.object(platform.torch, "device", device_factory),
+            patch.object(platform.torch.npu, "current_device", return_value=3),
+            patch.object(platform, "uuid4", return_value=SimpleNamespace(hex="hccl-name")),
+            patch.dict(
+                sys.modules,
+                {
+                    "torch_npu._C._distributed_c10d": SimpleNamespace(
+                        ProcessGroupHCCL=process_group_hccl,
+                    )
+                },
+            ),
+        ):
+            result = NPUPlatform.stateless_init_device_torch_dist_pg(
+                backend="hccl",
+                prefix_store=prefix_store,
+                group_rank=0,
+                group_size=2,
+                timeout=MagicMock(),
+            )
+
+        self.assertIs(result, process_group)
+        self.assertEqual(
+            device_factory.call_args_list,
+            [call("npu"), call("npu:3")],
+        )
+        self.assertIs(backend_options._device, comm_device)
+        self.assertEqual(backend_options.group_id, "hccl-name")
+        process_group._set_default_backend.assert_called_once_with(backend_type)
+        process_group._register_backend.assert_called_once_with(
+            backend_device,
+            backend_type,
+            hccl_backend,
+        )
+        group_store.set.assert_called_once_with("hccl_comm_name", "hccl-name")
+        hccl_backend._set_hccl_comm_name.assert_called_once_with("hccl-name")
 
     @staticmethod
     def mock_vllm_ascend_config():
@@ -154,6 +217,7 @@ class TestNPUPlatform(TestBase):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
         vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = True
         vllm_config.parallel_config.eplb_config.communicator = "pynccl"
 
         with patch.dict("os.environ", {}, clear=True):
@@ -163,6 +227,19 @@ class TestNPUPlatform(TestBase):
             vllm_config.parallel_config.eplb_config.communicator,
             "pynccl",
         )
+
+    def test_validate_eplb_config_rejects_pynccl_without_elastic_ep(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = False
+        vllm_config.parallel_config.eplb_config.communicator = "pynccl"
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            self.assertRaisesRegex(ValueError, "pynccl.*Elastic EP"),
+        ):
+            _validate_eplb_config(vllm_config)
 
     def test_validate_eplb_config_allows_load_collection_phase_with_dbo_and_spec_decode(
         self,

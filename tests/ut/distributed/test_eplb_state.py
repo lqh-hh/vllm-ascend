@@ -85,8 +85,10 @@ def test_async_rearrange_defers_routing_table_refresh_to_workspace_hook(monkeypa
 
 def test_from_mapping_refreshes_final_mapping(monkeypatch):
     model_state = object()
+    captured_kwargs = {}
 
     def upstream_from_mapping(cls, **kwargs):
+        captured_kwargs.update(kwargs)
         state = cls.__new__(cls)
         state.model_states = {"model": model_state}
         return state
@@ -105,8 +107,8 @@ def test_from_mapping_refreshes_final_mapping(monkeypatch):
         device=torch.device("cpu"),
         parallel_config=object(),
         expanded_physical_to_logical=torch.zeros(1),
-        num_valid_physical_experts=1,
     )
 
     assert isinstance(state, AscendEplbState)
+    assert "num_valid_physical_experts" not in captured_kwargs
     refresh.assert_called_once_with(model_state)

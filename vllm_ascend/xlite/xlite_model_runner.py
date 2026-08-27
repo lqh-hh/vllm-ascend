@@ -32,7 +32,7 @@ class XliteModelRunner(NPUModelRunner):
     def load_model(self, load_dummy_weights=False) -> None:
         from vllm_ascend.xlite.xlite import XliteWrapper
 
-        super().load_model()
+        super().load_model(load_dummy_weights=load_dummy_weights)
         self.model = self.xlite_model = XliteWrapper(self.model, self.vllm_config, device=self.device)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:

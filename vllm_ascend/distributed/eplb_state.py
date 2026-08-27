@@ -156,7 +156,6 @@ class AscendEplbState(_eplb_state.EplbState):
         device: torch.device,
         parallel_config,
         expanded_physical_to_logical: torch.Tensor,
-        num_valid_physical_experts: int,
     ) -> "AscendEplbState":
         state = super().from_mapping(
             model=model,
@@ -164,7 +163,6 @@ class AscendEplbState(_eplb_state.EplbState):
             device=device,
             parallel_config=parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
-            num_valid_physical_experts=num_valid_physical_experts,
         )
         for model_state in state.model_states.values():
             refresh_model_routing_tables(model_state)

@@ -21,27 +21,27 @@ def _patched_use_v2_model_runner(self) -> bool:
     return False
 
 
-_original_get_v2_model_runner_unsupported_features = (
-    VllmConfig._get_v2_model_runner_unsupported_features
-)
-
-# Upstream EEP (elastic expert parallelism) does not support the V2 model
-# runner, so it is listed as unsupported; Ascend's V2 runner supports
-# elastic EP, so drop that entry here.
-def _patched_get_v2_model_runner_unsupported_features(self) -> list[str]:
-    unsupported = _original_get_v2_model_runner_unsupported_features(self)
-    if "elastic expert parallelism" in unsupported:
-        unsupported.remove("elastic expert parallelism")
-    return unsupported
-
-
 VllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 
 def _patched_validate_v2_model_runner(self) -> None:
     if is_310p():
         return
-    _original_validate_v2_model_runner(self)
+
+    parallel_config = self.parallel_config
+    enable_elastic_ep = parallel_config.enable_elastic_ep
+    if not enable_elastic_ep:
+        _original_validate_v2_model_runner(self)
+        return
+
+    # Upstream validation rejects Elastic EP because the CUDA V2 runner does
+    # not support it. Ascend provides its own V2 implementation, so suppress
+    # only that input while preserving every other upstream validation.
+    parallel_config.enable_elastic_ep = False
+    try:
+        _original_validate_v2_model_runner(self)
+    finally:
+        parallel_config.enable_elastic_ep = enable_elastic_ep
 
 
 VllmConfig._validate_v2_model_runner = _patched_validate_v2_model_runner

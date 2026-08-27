@@ -88,7 +88,6 @@ class AscendEPLBController(EPLBController):
         model: nn.Module,
         model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
-        old_num_physical_experts: int,
     ) -> None:
         model = _unwrap_moe(model)
         assert is_mixture_of_experts(model)
@@ -98,6 +97,5 @@ class AscendEPLBController(EPLBController):
             device=self.device,
             parallel_config=self.parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
-            num_valid_physical_experts=old_num_physical_experts,
         )
         self._has_registered_models = True

@@ -167,6 +167,7 @@ class PyHcclCommunicator:
         if self.disabled:
             return None
         self._check_tensor_device(in_tensor)
+        self._check_tensor_device(out_tensor)
         stream = self._get_stream(stream)
         self.hccl.hcclAllGather(
             buffer_type(in_tensor.data_ptr()),

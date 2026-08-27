@@ -12,7 +12,10 @@ from vllm.distributed.eplb.eplb_communicator import (
     TorchDistNcclEplbCommunicator,
 )
 
-from vllm_ascend.distributed.eplb_communicator import HcclEplbCommunicator
+from vllm_ascend.distributed.eplb_communicator import (
+    HcclEplbCommunicator,
+    PyHcclEplbCommunicator,
+)
 
 
 @pytest.fixture
@@ -68,3 +71,44 @@ def test_execute_clears_queue_after_failure(communicator, monkeypatch):
         communicator.execute()
 
     assert communicator._p2p_ops == []
+
+
+@pytest.fixture
+def pyhccl_communicator(monkeypatch):
+    monkeypatch.setattr(EplbCommunicator, "_log_initialized", lambda self: None)
+    return PyHcclEplbCommunicator(MagicMock(), stream=MagicMock())
+
+
+def test_pyhccl_execute_orders_ops_by_expert_id(pyhccl_communicator):
+    first_tensor = torch.ones(1)
+    second_tensor = torch.ones(1)
+    captured_ops = []
+    pyhccl_communicator._pyhccl_comm.batch_isend_irecv.side_effect = lambda ops, stream: captured_ops.extend(ops)
+    pyhccl_communicator.add_send([first_tensor], dst_rank=1, expert_id=2)
+    pyhccl_communicator.add_recv([second_tensor], src_rank=1, expert_id=1)
+
+    pyhccl_communicator.execute()
+
+    assert [op.tag for op in captured_ops] == [1, 2]
+    assert pyhccl_communicator._p2p_ops == []
+
+
+def test_pyhccl_set_stream_updates_transfer_stream(pyhccl_communicator):
+    stream = MagicMock()
+
+    pyhccl_communicator.set_stream(stream)
+    pyhccl_communicator.add_send([torch.ones(1)], dst_rank=1, expert_id=1)
+    pyhccl_communicator.execute()
+
+    pyhccl_communicator._pyhccl_comm.batch_isend_irecv.assert_called_once()
+    assert pyhccl_communicator._pyhccl_comm.batch_isend_irecv.call_args.args[1] is stream
+
+
+def test_pyhccl_execute_clears_queue_after_failure(pyhccl_communicator):
+    pyhccl_communicator.add_send([torch.ones(1)], dst_rank=1, expert_id=1)
+    pyhccl_communicator._pyhccl_comm.batch_isend_irecv.side_effect = RuntimeError("transfer failed")
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        pyhccl_communicator.execute()
+
+    assert pyhccl_communicator._p2p_ops == []

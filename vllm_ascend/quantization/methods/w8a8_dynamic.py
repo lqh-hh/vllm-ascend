@@ -183,6 +183,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             vllm_config.use_v2_model_runner is True and vllm_config.parallel_config.enable_eplb is True
         )
         self.in_dtype = vllm_config.model_config.dtype
+        self.moe_all_to_all_group_name = ""
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             try:
                 device_group = get_mc2_group().device_group
@@ -194,7 +195,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                     "[vllm-ascend/W8A8_DYNAMIC] MC2 group metadata unavailable, "
                     "falling back to empty moe_all_to_all_group_name."
                 )
-                self.moe_all_to_all_group_name = ""
 
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype

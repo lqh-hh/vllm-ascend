@@ -369,6 +369,9 @@ class NPUWorker(WorkerBase):
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 
+        if elastic_ep_executor := getattr(self, "elastic_ep_executor", None):
+            elastic_ep_executor.shutdown()
+
         if model_runner := getattr(self, "model_runner", None):
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
@@ -738,7 +741,7 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
 
         with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model(load_dummy_weights)
+            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
@@ -1148,6 +1151,8 @@ class NPUWorker(WorkerBase):
         return
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        if self.elastic_ep_executor is None:
+            raise RuntimeError("Elastic EP is not enabled for this worker")
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 

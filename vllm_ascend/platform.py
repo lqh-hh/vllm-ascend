@@ -26,7 +26,7 @@ from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
-from torch.distributed.distributed_c10d import Backend, PrefixStore, ProcessGroup
+from torch.distributed import PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -191,6 +191,62 @@ class NPUPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
+
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: PrefixStore,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+    ) -> ProcessGroup:
+        """Create a stateless HCCL process group for Elastic EP."""
+        if backend != "hccl":
+            raise ValueError(f"NPU stateless process groups require HCCL, got {backend!r}.")
+
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        process_group = ProcessGroup(prefix_store, group_rank, group_size)
+        group_store = process_group.get_group_store()
+        if group_rank == 0:
+            hccl_comm_name = uuid4().hex
+            group_store.set("hccl_comm_name", hccl_comm_name)
+        else:
+            hccl_comm_name = group_store.get("hccl_comm_name").decode("utf-8")
+
+        backend_options = ProcessGroupHCCL.Options()
+        backend_options._timeout = timeout
+        if hasattr(backend_options, "group_id"):
+            # ProcessGroupHCCL derives its internal HCCL group name from
+            # ``group_id`` in the constructor. Set it before construction so
+            # concurrently-created standby DP/EP groups do not all register
+            # the default ``group_name_`` in HCCL's Group2Comm map.
+            backend_options.group_id = hccl_comm_name
+
+        backend_device = torch.device("npu")
+        comm_device = torch.device(f"npu:{torch.npu.current_device()}")
+        if hasattr(backend_options, "_device"):
+            # Elastic EP creates standby process groups from a background
+            # thread. Bind HCCL to the device selected for that worker instead
+            # of leaving the device index unspecified, which can make multiple
+            # ranks initialize their communicator on physical NPU 0.
+            backend_options._device = comm_device
+
+        hccl_backend = ProcessGroupHCCL(
+            prefix_store,
+            group_rank,
+            group_size,
+            backend_options,
+        )
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        process_group._set_default_backend(backend_type)
+        hccl_backend._set_sequence_number_for_group()
+        process_group._register_backend(backend_device, backend_type, hccl_backend)
+
+        hccl_backend._set_hccl_comm_name(hccl_comm_name)
+        process_group._set_group_desc("undefined")
+        return process_group
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
@@ -585,50 +641,6 @@ class NPUPlatform(Platform):
             "sinks": sinks,
         }
 
-    @classmethod
-    def stateless_init_device_torch_dist_pg(
-        cls,
-        backend: str,
-        prefix_store: PrefixStore,
-        group_rank: int,
-        group_size: int,
-        timeout: timedelta,
-    ) -> ProcessGroup:
-        """Create a stateless HCCL ProcessGroup"""
-        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
-
-        pg = ProcessGroup(prefix_store, group_rank, group_size)
-
-        backend_options = ProcessGroupHCCL.Options()
-        backend_options._timeout = timeout
-
-        # Create Backend object
-        backend = Backend("hccl")
-
-        # Set default backend for ProcessGroup
-        pg._set_default_backend(Backend.backend_type_map[backend])
-
-        device = torch.device("npu")
-        if hasattr(backend_options, "_device"):
-            backend_options._device = device
-
-        backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
-
-        backend_class._set_sequence_number_for_group()
-        backend_type = ProcessGroup.BackendType.CUSTOM
-        pg._register_backend(device, backend_type, backend_class)
-        if group_rank == 0:
-            hccl_comm_name = uuid4().hex
-            pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
-        else:
-            hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
-        if hccl_comm_name is not None:
-            group_desc = "undefined"
-            backend_class._set_hccl_comm_name(hccl_comm_name)
-            pg._set_group_desc(group_desc)
-
-        return pg
-
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
     """
@@ -892,15 +904,20 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 raise ValueError(
                     "Async EPLB is not supported by Model Runner V2 on Ascend yet; set eplb_config.use_async to false."
                 )
-            if upstream_eplb_config.communicator not in (None, "torch_nccl", "torch_gloo"):
+            allowed_communicators = {None, "torch_nccl", "torch_gloo"}
+            if vllm_config.parallel_config.enable_elastic_ep:
+                allowed_communicators.add("pynccl")
+            if upstream_eplb_config.communicator not in allowed_communicators:
                 raise ValueError(
-                    "Do not set eplb_config.communicator on Ascend; "
-                    "torch.distributed over HCCL is selected automatically."
+                    "Only torch_nccl and torch_gloo are supported by EPLB on Ascend; "
+                    "pynccl is additionally supported when Elastic EP is enabled."
                 )
             # ParallelConfig chooses torch_gloo as its generic synchronous
-            # default before this platform hook runs. Ascend maps torch_nccl
-            # to torch.distributed over the HCCL device process group.
-            upstream_eplb_config.communicator = "torch_nccl"
+            # default before this platform hook runs. Ascend maps it to
+            # torch.distributed over HCCL, while an explicit pynccl selection
+            # is retained for Elastic EP's PyHccl communicator.
+            if upstream_eplb_config.communicator in (None, "torch_gloo"):
+                upstream_eplb_config.communicator = "torch_nccl"
     elif "load_collection_phase" in eplb_config:
         raise ValueError(
             "additional_config.eplb_config.load_collection_phase is only supported by "

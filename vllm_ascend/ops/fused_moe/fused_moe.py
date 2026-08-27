@@ -16,6 +16,7 @@
 #
 import torch
 import torch.nn.functional as F
+import vllm.envs as envs
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -74,7 +75,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.moe_config.dp_group = get_dp_group()
         if self.moe_config.ep_size > 1:
             self.moe_config.ep_group = get_ep_group()
-            self.moe_config.mc2_group = get_mc2_group()
+            # A newly launched elastic-EP worker receives its MC2 group during
+            # switch_and_prepare, after all old and new ranks have created the
+            # standby group together.
+            if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                self.moe_config.mc2_group = get_mc2_group()
 
         self.ascend_shared_experts = None
         if shared_experts is not None:
@@ -86,7 +91,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 self._quant_method,
             )
 
-        setup_moe_comm_method(self.moe_config)
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            setup_moe_comm_method(self.moe_config)
         alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
         if alltoall_comm is not None:
             expert_ids_per_ep_rank = getattr(alltoall_comm.token_dispatcher, "expert_ids_per_ep_rank", None)

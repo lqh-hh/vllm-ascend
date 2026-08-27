@@ -947,6 +947,43 @@ class TestUpstreamConfigCompatibility(TestBase):
         with self.assertRaisesRegex(NotImplementedError, "only supported on A2 and A3"):
             config._validate_mc2_hierarchy_comm(vllm_config)
 
+    @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    def test_elastic_ep_rejects_non_a3_without_mc2_hierarchy(self, _):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_mc2_hierarchy_comm=False,
+        )
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+        )
+
+        with self.assertRaisesRegex(ValueError, "Elastic EP is only supported on A3"):
+            config._validate_elastic_ep(vllm_config)
+
+    @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    def test_elastic_ep_rejects_dynamic_eplb(self, _):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            eplb_config=EplbConfig(dynamic_eplb=True),
+        )
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+        )
+
+        with self.assertRaisesRegex(ValueError, "dynamic_eplb=True"):
+            config._validate_elastic_ep(vllm_config)
+
+    @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    def test_elastic_ep_accepts_a3_without_dynamic_eplb(self, _):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        )
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+        )
+
+        config._validate_elastic_ep(vllm_config)
+
 
 class TestTopLevelSwitchTypeValidation(TestBase):
     """Verify @config migration gives top-level AscendConfig switches type validation.

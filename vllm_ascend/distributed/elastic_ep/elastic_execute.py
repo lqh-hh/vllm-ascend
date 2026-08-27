@@ -5,10 +5,10 @@ import gc
 import threading
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
-from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+import vllm.distributed.elastic_ep.elastic_execute as upstream_elastic_execute
 from torch.distributed import P2POp
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
@@ -37,9 +37,20 @@ from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
 )
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
-from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
 
 _PATCH_LOCK = threading.Lock()
+
+
+def _match_peer_parameters(
+    parameter_names: list[str],
+    parameters: list[torch.Tensor],
+    peer_parameter_names: list[str],
+) -> list[torch.Tensor]:
+    if parameter_names == peer_parameter_names:
+        return parameters
+    parameters_by_name = dict(zip(parameter_names, parameters, strict=True))
+    common_names = sorted(parameters_by_name.keys() & set(peer_parameter_names))
+    return [parameters_by_name[name] for name in common_names]
 
 
 def ascend_batch_transfer_weights(
@@ -51,7 +62,7 @@ def ascend_batch_transfer_weights(
 ) -> None:
     # Ascend HCCL P2P weight transfer. Replaces upstream batch_transfer_weights via
     # monkey-patch. Differs from upstream: collects params from __dict__/AttentionImplBase,
-    # negotiates param names via TCP store, skips contiguous() (HCCL native support).
+    # negotiates parameter names via the TCP store.
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
     if device_comm is None:
@@ -102,32 +113,35 @@ def ascend_batch_transfer_weights(
         peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
         tcp_store_group.send_obj(all_params_name, dst=peer_rank)
 
-    if len(all_params_name) != len(peer_rank_all_params_name):
-        common = list(set(all_params_name) & set(peer_rank_all_params_name))
-        ids = [all_params_name.index(name) for name in common]
-        all_params = [param for idx, param in enumerate(all_params) if idx in ids]
+    all_params = _match_peer_parameters(
+        all_params_name,
+        all_params,
+        peer_rank_all_params_name,
+    )
 
     assert len(all_params) > 0
     p2p_ops = []
     for param in all_params:
+        # HCCL P2P transfers flat memory and does not honor tensor strides.
+        transfer_param = param.contiguous()
         op = object.__new__(P2POp)
-        if is_sender:
-            op.op = torch.distributed.isend
-            op.tensor = param
-        else:
-            op.op = torch.distributed.irecv
-            op.tensor = param
+        op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
+        op.tensor = transfer_param
         op.group_peer = peer_rank
         p2p_ops.append(op)
+        if transfer_param is not param:
+            device_comm.batch_isend_irecv(p2p_ops)
+            p2p_ops.clear()
+            if not is_sender:
+                param.copy_(transfer_param)
 
-    device_comm.batch_isend_irecv(p2p_ops)
+    if p2p_ops:
+        device_comm.batch_isend_irecv(p2p_ops)
 
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
-    if isinstance(
-        quant_method := getattr(module.routed_experts.quant_method, "quant_method", None),
-        AscendW8A8DynamicFusedMoEMethod,
-    ):
+    quant_method = getattr(module.routed_experts.quant_method, "quant_method", None)
+    if hasattr(quant_method, "moe_all_to_all_group_name"):
         try:
             device_group = get_mc2_group().device_group
             local_rank = get_mc2_group().rank_in_group
@@ -141,22 +155,21 @@ def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
     @contextmanager
     def _use_ascend_transfer_impl(self):
-        with patch(
-            "vllm.distributed.elastic_ep.elastic_execute.batch_transfer_weights", new=ascend_batch_transfer_weights
-        ):
+        original_transfer = upstream_elastic_execute.batch_transfer_weights
+        upstream_elastic_execute.batch_transfer_weights = ascend_batch_transfer_weights
+        try:
             yield
+        finally:
+            upstream_elastic_execute.batch_transfer_weights = original_transfer
 
-    def create_standby_groups(
-        self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
-    ) -> None:
-        # Reuse the upstream implementation to build the world / dp / ep / eplb
-        # standby groups, then create the Ascend-specific MC2 standby group.
-        super().create_standby_groups(reconfig_request, use_all2all)
+    def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
+        # Let upstream prepare world / DP / EP / EPLB and weight transfer, then
+        # add the Ascend-specific MC2 standby group used at commit time.
+        super().prepare_reconfiguration(reconfig_request, use_all2all)
         create_ascend_standby_groups(
             new_dp_size=reconfig_request.new_data_parallel_size,
             new_world_size_across_dp=(
-                self.worker.vllm_config.parallel_config.world_size
-                * reconfig_request.new_data_parallel_size
+                self.worker.vllm_config.parallel_config.world_size * reconfig_request.new_data_parallel_size
             ),
             master_ip=reconfig_request.new_data_parallel_master_ip,
             coord_store_port=reconfig_request.coord_store_port,
@@ -200,27 +213,50 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         super().switch_and_remove()
         _replace_ascend_active_groups(mc2=None)
 
-    def switch_and_prepare(self) -> None:
-        super().switch_and_prepare()
+    def _activate_ascend_standby_groups(self) -> None:
         _replace_ascend_active_groups(**pop_ascend_standby_groups())
-        self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
-        self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
+        parallel_config = self.worker.vllm_config.parallel_config
+        self.worker.model_runner.dp_size = parallel_config.data_parallel_size
+        self.worker.model_runner.dp_rank = parallel_config.data_parallel_rank
         moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
         for module in moe_modules:
             module.moe_config.tp_group = get_tp_group()
             module.moe_config.dp_group = get_dp_group()
             module.moe_config.ep_group = get_ep_group()
             module.moe_config.mc2_group = get_mc2_group()
-        self._setup_moe_comm_and_quant_method()
 
-    def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
-        mapping, num_logical_experts, num_valid_experts = super().receive_expert_mapping()
+    def switch_and_prepare(self):
+        retired_groups = super().switch_and_prepare()
+        self._activate_ascend_standby_groups()
         self._setup_moe_comm_and_quant_method()
-        return mapping, num_logical_experts, num_valid_experts
+        return retired_groups
 
-    def receive_weights(self) -> None:
+    def commit_scale_up(self, is_existing_worker: bool) -> None:
+        if not is_existing_worker:
+            # New workers already use the new upstream DP/EP groups and do not
+            # run switch_and_prepare. Install the MC2 group they created in
+            # prepare_new_worker before expert mapping initializes MoE comms.
+            self._activate_ascend_standby_groups()
+        super().commit_scale_up(is_existing_worker)
+
+    def receive_expert_mapping(self) -> torch.Tensor:
+        mapping = super().receive_expert_mapping()
+        self._setup_moe_comm_and_quant_method()
+        return mapping
+
+    def prepare_new_worker(self) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
-            super().receive_weights()
+            super().prepare_new_worker()
+        parallel_config = self.worker.vllm_config.parallel_config
+        # Existing workers create this group after their upstream preparation.
+        # The new worker follows prepare_new_worker instead, so it must join the
+        # same stateless MC2 creation here to avoid leaving old ranks waiting.
+        create_ascend_standby_groups(
+            new_dp_size=parallel_config.data_parallel_size,
+            new_world_size_across_dp=parallel_config.world_size * parallel_config.data_parallel_size,
+            master_ip=parallel_config.data_parallel_master_ip,
+            coord_store_port=parallel_config._coord_store_port,
+        )
 
     def warmup_local_kernels(self) -> None:
         pass

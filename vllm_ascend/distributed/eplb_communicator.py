@@ -27,7 +27,7 @@ class PyHcclEplbCommunicator(EplbCommunicator):
         stream: torch.npu.Stream | None = None,
     ) -> None:
         self._pyhccl_comm = pyhccl_comm
-        self._stream = stream
+        self._cuda_stream = stream
         self._p2p_ops: list[P2POp] = []
         self._log_initialized()
 
@@ -64,7 +64,7 @@ class PyHcclEplbCommunicator(EplbCommunicator):
             return
         self._p2p_ops.sort(key=lambda op: op.tag)
         try:
-            self._pyhccl_comm.batch_isend_irecv(self._p2p_ops, self._stream)
+            self._pyhccl_comm.batch_isend_irecv(self._p2p_ops, self._cuda_stream)
         finally:
             self._p2p_ops.clear()
 

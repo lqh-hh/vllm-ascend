@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 
@@ -130,14 +131,16 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         if self.quant_method == ASCEND_QUANTIZATION_METHOD and self.tp_size > 16:
             raise ValueError("The current weight does not support moe part tp>16.")
 
-        try:
-            device_group = get_mc2_group().device_group
-            # TODO: Try local_rank = ep_group.rank_in_group
-            local_rank = torch.distributed.get_rank(group=device_group)
-            backend = device_group._get_backend(torch.device("npu"))
-            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-        except AttributeError:
-            self.moe_all_to_all_group_name = ""
+        self.moe_all_to_all_group_name = ""
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            try:
+                device_group = get_mc2_group().device_group
+                # TODO: Try local_rank = ep_group.rank_in_group
+                local_rank = torch.distributed.get_rank(group=device_group)
+                backend = device_group._get_backend(torch.device("npu"))
+                self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+            except AttributeError:
+                pass
 
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
