@@ -11,6 +11,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -341,11 +342,16 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
     elif soc_version == AscendDeviceType.A2:
         moe_comm_type = _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
     elif soc_version == AscendDeviceType.A3:
-        moe_comm_type = _select_a3_moe_comm_method(
-            num_tokens,
-            mc2_tokens_capacity,
-            vllm_config,
-        )
+        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+            # The fused MC2 implementation bypasses TokenDispatcherWithMC2,
+            # so explicitly select MC2 whenever the V3 dispatcher is enabled.
+            moe_comm_type = MoECommType.MC2
+        else:
+            moe_comm_type = _select_a3_moe_comm_method(
+                num_tokens,
+                mc2_tokens_capacity,
+                vllm_config,
+            )
     elif soc_version == AscendDeviceType.A5:
         moe_comm_type = _select_a5_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
     elif soc_version == AscendDeviceType._310P:
