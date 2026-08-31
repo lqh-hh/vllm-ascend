@@ -410,6 +410,7 @@ class AscendConfig:
     mlapo_keep_prefill_weights: bool = False
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
+    ft_communication_ops_abort_timeout_ms: int = 0
     weight_nz_mode: int = 1
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
@@ -460,6 +461,11 @@ class AscendConfig:
         elif self.enable_fused_mc2 == 2:
             _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
             self.enable_fused_mc2 = 1
+        if self.ft_communication_ops_abort_timeout_ms < 0:
+            raise ValueError(
+                "ft_communication_ops_abort_timeout_ms must be a non-negative "
+                f"integer, got {self.ft_communication_ops_abort_timeout_ms}"
+            )
         return self
 
     # ---- derivations + cross-config downgrades/mutex ----
@@ -699,7 +705,15 @@ class AscendConfig:
             )
 
     def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
-        if not vllm_config.parallel_config.enable_elastic_ep:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep and parallel_config.enable_fault_tolerance:
+            raise ValueError(
+                "Elastic EP and fault-tolerance scale-down cannot be enabled "
+                "together. Elastic EP rebuilds MC2 groups, while fault-tolerance "
+                "scale-down preserves the original rank coordinates."
+            )
+
+        if not parallel_config.enable_elastic_ep:
             return
 
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -1414,6 +1428,12 @@ def init_ascend_config(vllm_config):
         "batch_job_sched_config",
     }
     kwargs = {k: v for k, v in additional_config.items() if k not in _NON_USER_INPUT_KEYS}
+    if "ft_communication_ops_abort_timeout_ms" not in kwargs:
+        from vllm_ascend import envs as ascend_envs
+
+        kwargs["ft_communication_ops_abort_timeout_ms"] = (
+            ascend_envs.VLLM_ASCEND_FT_COMMUNICATION_OPS_ABORT_TIMEOUT_MS
+        )
 
     new_config = AscendConfig(  # type: ignore[call-arg]
         scheduler_config=sched,

@@ -24,20 +24,110 @@ from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicat
 
 
 class _NpuAll2AllManager:
-    """No-op all2all_manager for NPU. Used by vLLM main's fault-tolerance
-    check (data_parallel_size > 1 and is_moe); NPU does not register a real
-    one because it uses mc2 / all_gather for MoE communication.
+    """All2All-manager adapter for MC2 fault tolerance.
+
+    Owns the dead-rank mask together with the `elastic_info` tensor the mask
+    is encoded into: the MC2 dispatch/combine operators take `elastic_info`
+    fresh on every call, so this tensor doubles as the mask (there is no
+    kernel-side mask buffer like DeepEP/nixl-ep). The public interface mirrors
+    the upstream All2AllManagerBase mask API so the upstream FT sentinel
+    drives it unchanged; future Ascend operators with FT support are expected
+    to follow the same shape.
     """
 
-    @property
-    def support_fault_tolerance(self) -> bool:
-        return False
+    # Unlike DeepEP/nixl-ep, the MC2 kernels neither detect faults nor set
+    # the mask themselves on timeout — a dead peer surfaces as an aborted op
+    # raising out of the forward, and the mask is only ever written host-side
+    # by FT recovery (scale_down, plus the retry mask replay). A per-step
+    # query_fault() could therefore never observe anything; reporting False
+    # keeps the upstream runners from paying for that query every step.
+    support_fault_tolerance = False
 
-    def query_fault(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=torch.bool, device="cpu")
+    def __init__(self, ep_world_size: int, device: torch.device | None = None) -> None:
+        self._ep_world_size = ep_world_size
+        if device is None:
+            device = torch.device("npu", torch.npu.current_device())
+        elif not isinstance(device, torch.device):
+            device = torch.device("npu", device)
+        self._device = device
+        self._dead: set[int] = set()
+        self._num_physical_experts: int = 0
+
+        # elastic_info layout: [is_scaling_down, dense ep world size,
+        #  shared_expert_rank_num, num_physical_experts] + table1(orig->dense)
+        #  + table2(dense->orig).
+        size = 4 + 2 * ep_world_size
+        self._elastic_info_host = torch.zeros(size, dtype=torch.int32)
+        # Allocate lazily on the first MC2 call. NPUCommunicator instances are
+        # also created for non-EP groups, which never consume elastic_info.
+        self._elastic_info: torch.Tensor | None = None
+
+    def update_mask(self, rank: int, masked: bool = True) -> None:
+        """Mark an EP rank dead/alive and rebuild elastic_info in place."""
+        if masked:
+            self._dead.add(rank)
+        else:
+            self._dead.discard(rank)
+        self._rebuild_elastic_info()
 
     def query_active_mask(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=torch.bool, device="cpu")
+        """Per-EP-rank mask (1=dead, 0=live) as a CPU tensor, matching the
+        upstream mask-buffer convention.
+
+        Built on CPU on purpose: this is called while a fault is being
+        probed, when the NPU may be hung — any device op would fail.
+        """
+        mask = torch.zeros(self._ep_world_size, dtype=torch.int32)
+        for rank in self._dead:
+            mask[rank] = 1
+        return mask
+
+    def query_fault(self) -> torch.Tensor:
+        # NPU counterpart of the upstream per-step fault check. Unlike
+        # DeepEP/nixl-ep there is no in-kernel timeout that flips the mask,
+        # so a fault can never be observed this way — always report no fault.
+        # (Faults surface as aborted HCCL ops raising out of execute_model;
+        # see support_fault_tolerance.)
+        return torch.tensor(False)
+
+    def clean_buffers(self) -> None:
+        """No-op, kept for the upstream retry flow which calls it
+        unconditionally.
+
+        Unlike DeepEP/nixl-ep there is no kernel-side mask buffer or RDMA
+        state to clean: the elastic_info tensor is passed fresh to every MC2
+        call, so the mask itself is intentionally left untouched (it survives
+        across recovery rounds via the replayed cumulative dead set).
+        """
+
+    def get_elastic_info(self) -> torch.Tensor:
+        """The device elastic_info tensor for the next MC2 dispatch/combine."""
+        if self._elastic_info is None:
+            self._elastic_info = self._elastic_info_host.to(self._device)
+        return self._elastic_info
+
+    def set_num_physical_experts(self, num_physical_experts: int) -> None:
+        """Shrink the expert-space width after scale-down and rebuild."""
+        self._num_physical_experts = num_physical_experts
+        self._rebuild_elastic_info()
+
+    def _rebuild_elastic_info(self) -> None:
+        """Rebuild elastic_info from the dead set into the existing device
+        tensor (never reallocates, so captured graphs stay valid)."""
+
+        world_size = self._ep_world_size
+        alive = sorted(set(range(world_size)) - self._dead)
+        table1 = torch.full((world_size,), -1, dtype=torch.int32)
+        table1[alive] = torch.arange(len(alive), dtype=torch.int32)
+        table2 = torch.full((world_size,), -1, dtype=torch.int32)
+        table2[: len(alive)] = torch.tensor(alive, dtype=torch.int32)
+        self._elastic_info_host.copy_(
+            torch.cat(
+                [torch.tensor([1, len(alive), 0, self._num_physical_experts], dtype=torch.int32), table1, table2]
+            )
+        )
+        if self._elastic_info is not None:
+            self._elastic_info.copy_(self._elastic_info_host, non_blocking=True)
 
 
 class NPUCommunicator(DeviceCommunicatorBase):
@@ -80,7 +170,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
             )
 
         self.ca_comm = None
-        self.all2all_manager = _NpuAll2AllManager()
+        self.all2all_manager = _NpuAll2AllManager(self.world_size, self.device)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         pyhccl_comm = self.pyhccl_comm
