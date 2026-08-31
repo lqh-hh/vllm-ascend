@@ -97,6 +97,7 @@ class TestTokenDispatcherWithMC2(TestBase):
         mock_config.speculative_config = None
 
         mock_config.parallel_config.tensor_parallel_size = 1
+        mock_config.parallel_config.enable_fault_tolerance = False
 
         self.mock_get_config.return_value = mock_config
         self.mc2_tokens_capacity = 128
@@ -167,6 +168,18 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertEqual(self.dispatcher.ep_world_size, 8)
         self.assertTrue(self.dispatcher.need_extra_args)
         self.assertEqual(self.dispatcher.global_bs, 0)
+
+    def test_init_with_fault_tolerance(self):
+        parallel_config = self.mock_get_config.return_value.parallel_config
+        parallel_config.enable_fault_tolerance = True
+
+        dispatcher = TokenDispatcherWithMC2(
+            with_quant=False,
+            top_k=8,
+            num_experts=128,
+        )
+
+        self.assertTrue(dispatcher._ft_enabled)
 
     def test_init_uses_mc2_capacity_for_non_uniform_global_bs(self):
         self.mock_get_config.return_value.parallel_config.tensor_parallel_size = 4
@@ -733,13 +746,14 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.mock_ep_rank_prop = patcher2.start()
         self.mock_ep_size_prop = patcher3.start()
 
-        # TokenDispatcherWithAll2AllV obtains the local rank while building
-        # the HCCL group name.  A MagicMock group alone is not sufficient on
-        # vLLM v0.26.0: torch.distributed.get_rank still attempts to resolve
-        # the uninitialized default process group first.
-        patcher_rank = patch("torch.distributed.get_rank", return_value=0)
-        self.mock_get_rank = patcher_rank.start()
-        self.addCleanup(patcher_rank.stop)
+        # TokenDispatcherWithAll2AllV obtains the local rank directly from
+        # get_ep_group() while building the HCCL group name. Mock the symbol
+        # imported by token_dispatcher so no initialized process group is
+        # required by this unit test.
+        patcher_get_ep_group = patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group")
+        self.mock_get_ep_group = patcher_get_ep_group.start()
+        self.mock_get_ep_group.return_value.rank_in_group = 0
+        self.addCleanup(patcher_get_ep_group.stop)
 
         # Mock torch_npu.npu_moe_token_permute
         patcher4 = patch("torch_npu.npu_moe_token_permute", create=True)

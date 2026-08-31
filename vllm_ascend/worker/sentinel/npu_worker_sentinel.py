@@ -1,0 +1,223 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING, Callable
+
+import torch
+import torch_npu
+from vllm.distributed.parallel_state import get_ep_group
+from vllm.logger import logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
+    WorkerSentinel as GPUWorkerSentinel,
+)
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
+from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.worker.sentinel.eplb_redistribute import (
+    build_local_reload_plan,
+    build_orig_to_dense_rank_table,
+    check_redundancy_sufficient,
+    compute_dead_ep_ranks,
+    densify_routing_table_physical_ids,
+    mark_dead_expert_slots_inplace,
+    rebuild_logical_expert_maps,
+    redistribute_expert_placement,
+    reload_experts_from_disk,
+    validate_expert_reload_support,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_worker import Worker
+
+
+def fault_barrier_wrapper(func: Callable):
+    """Quarantine and reset the worker when a wrapped method faults."""
+
+    def wrapped(self, *args, **kwargs):
+        sentinel = getattr(self, "worker_sentinel", None)
+        if sentinel is not None and sentinel.worker_faulted:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        try:
+            return func(self, *args, **kwargs)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            if sentinel is not None:
+                sentinel.worker_faulted = True
+                logger.warning("[FT] Quarantining worker %d after fault: %s", self.rank, exc)
+                try:
+                    sentinel.reset_device()
+                except Exception:
+                    logger.exception("[FT] self device reset failed on worker %d.", self.rank)
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            raise
+
+    return wrapped
+
+
+class WorkerSentinel(GPUWorkerSentinel):
+    """Per-worker sentinel for fault tolerance on Ascend NPU.
+
+    Handles commands dispatched from EngineCoreSentinel via collective_rpc,
+    including device restart and DP group re-initialization on retry, and
+    MC2 elastic_info masking + expert redistribution on scale_down.
+    """
+
+    def __init__(self, worker: "Worker", device: torch.device):
+        self.device = device
+        self.worker = worker
+        # Set once a device-touching method faults, to keep this worker off the
+        # device until FT recovery rebuilds the groups.
+        self.worker_faulted = False
+
+    def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
+        """Report the dead-rank mask (upstream convention: 0=live, 1=dead).
+
+        Pure CPU read: on NPU the mask is only ever written host-side during
+        FT recovery, so on a first fault this is all zeros and the
+        orchestrator's retry-vs-scale_down decision must come from its own
+        cluster knowledge.
+        """
+        return {"mask": get_ep_all2all_manager().query_active_mask().tolist()}
+
+    def reset_device(self) -> None:
+        from vllm_ascend.platform import NPUPlatform
+
+        NPUPlatform.set_device(self.device)
+        torch_npu.npu.stop_device(self.device.index)
+        torch_npu.npu.restart_device(self.device.index)
+        torch_npu.distributed.reinit_process_group(None, False)
+        torch.npu.synchronize()
+
+    def retry(self, ft_request: FaultToleranceRequest):
+        # reset the device first so any hung device-side collectives are
+        # aborted, then run the base class flow (synchronize, clean worker
+        # state, re-initialize the DP group). The quarantine is lifted only
+        # after the groups are rebuilt below.
+        self.reset_device()
+        super().retry(ft_request)
+        self.worker_faulted = False
+
+    def scale_down(self, ft_request: FaultToleranceRequest):
+        """Scale down over the surviving DP ranks, mirroring the upstream
+        GPUWorkerSentinel.scale_down structure."""
+        self._validate_scale_down_preconditions()
+        params = ft_request.params
+        tp_size = self.worker.parallel_config.tensor_parallel_size
+        dead_ep_ranks = compute_dead_ep_ranks(params["dead_dp_ranks"], tp_size)
+        eplb_model_state = self._eplb_model_state()
+        ep_world_size = get_mc2_group().world_size
+
+        check_redundancy_sufficient(
+            eplb_model_state.logical_replica_count.shape[1],
+            eplb_model_state.physical_to_logical_map.shape[1] // ep_world_size,
+            ep_world_size,
+            dead_ep_ranks,
+        )
+        # Suppress EPLB before retry so the base flow skips the EPLB group
+        # reinit; the expert placement is fixed by the redistribution below.
+        self.worker.model_runner.eep_eplb_suppressed = True
+        # Device reset + worker-state cleanup + DP gloo group rebuilt with
+        # the densified membership; the base retry also replays the
+        # cumulative dead set into the elastic_info mask via update_mask.
+        self.retry(ft_request)
+
+        self._redistribute_experts(dead_ep_ranks)
+
+        # Verify the redistributed model is runnable before reporting healthy.
+        self.worker.execute_dummy_batch()
+        torch.npu.synchronize()
+
+        logger.info(
+            "[FT] Worker scale_down complete: dp_group_size=%d, "
+            "dp_group_rank=%d, dead_ep_ranks=%s, eplb_suppressed=True",
+            params["dp_group_size"],
+            params["dp_group_rank"],
+            sorted(dead_ep_ranks),
+        )
+
+    def _validate_scale_down_preconditions(self) -> None:
+        if not self.worker.use_v2_model_runner:
+            raise ValueError("[FT] scale_down on Ascend NPU requires the v2 model runner.")
+        model_runner = self.worker.model_runner
+        eplb_config = self.worker.parallel_config.eplb_config
+        if model_runner.eplb_state is None or eplb_config.num_redundant_experts <= 0:
+            raise ValueError(
+                "[FT] scale_down requires EPLB with num_redundant_experts > 0 to re-host the dead rank's experts."
+            )
+        ascend_config = get_ascend_config()
+        if ascend_config.enable_fused_mc2:
+            raise ValueError(
+                "[FT] scale_down is not supported with enable_fused_mc2: the "
+                "fused dispatch_ffn_combine operators take no elastic_info."
+            )
+        if ascend_config.get_mc2_comm_alg() == "hierarchy":
+            raise ValueError(
+                "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
+            )
+        if not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+            raise ValueError(
+                "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
+                "(aclnn V3+); please upgrade the CANN/torch_npu version."
+            )
+        validate_expert_reload_support(model_runner.model)
+
+    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> None:
+        """Redistribute experts onto the surviving slots after scale-down.
+
+        Deterministic and local: every survivor runs the same placement math
+        (imported from upstream), then applies it to the Ascend routing tables,
+        reloads reassigned weights from disk, and shrinks the MC2 expert width.
+        """
+        eplb_model_state = self._eplb_model_state()
+        p2l = eplb_model_state.physical_to_logical_map
+        l2p = eplb_model_state.logical_to_physical_map
+        lrc = eplb_model_state.logical_replica_count
+        num_logical = lrc.shape[1]
+        ep_world_size = get_ep_group().world_size
+        num_local_experts = p2l.shape[1] // ep_world_size
+        # The original EP rank; never rewritten by scale-down.
+        ep_rank = get_ep_group().rank_in_group
+
+        p2l_before = p2l.cpu().clone()
+        mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
+        redistribute_expert_placement(p2l, num_logical, num_local_experts)
+        rebuild_logical_expert_maps(p2l, l2p, lrc)
+        # Propagate the new placement into the Ascend routing tables (in-place,
+        # so captured graphs keep pointing at valid storage).
+        refresh_model_routing_tables(eplb_model_state)
+
+        # The MC2 kernels consume the routing tables in the densified id space;
+        # renumber the kernel-facing values in place after the refresh. The
+        # dead set is cumulative (accumulated across recovery rounds), so
+        # derive it from the manager's mask rather than this round's ranks.
+        active_mask = get_ep_all2all_manager().query_active_mask()
+        dead_ranks = {rank for rank, is_dead in enumerate(active_mask.tolist()) if is_dead}
+        orig_to_dense_rank = build_orig_to_dense_rank_table(ep_world_size, dead_ranks)
+        for layer in eplb_model_state.model.moe_layers:
+            routing_table = getattr(getattr(layer, "eplb_state", None), "expert_replica_routing_table", None)
+            if routing_table is not None:
+                densify_routing_table_physical_ids(routing_table, orig_to_dense_rank, num_local_experts)
+
+        reload_plan = build_local_reload_plan(p2l_before, p2l.cpu(), ep_rank, num_local_experts)
+        if reload_plan:
+            reload_experts_from_disk(
+                self.worker.model_runner.model,
+                self.worker.vllm_config,
+                reload_plan,
+            )
+
+        # Shrink the physical-expert width to the surviving slots; this also
+        # flips elastic_info into scaling-down mode.
+        get_ep_all2all_manager().set_num_physical_experts((ep_world_size - len(dead_ep_ranks)) * num_local_experts)
+
+        logger.info(
+            "[FT] Expert redistribution: num_logical=%d, ep_world_size=%d, num_local_experts=%d, reloaded_slots=%s",
+            num_logical,
+            ep_world_size,
+            num_local_experts,
+            sum(len(v) for v in reload_plan.values()),
+        )
