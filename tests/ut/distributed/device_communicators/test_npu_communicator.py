@@ -100,6 +100,19 @@ class TestNPUCommunicator(TestBase):
 
         communicator.pyhccl_comm.batch_isend_irecv.assert_called_once_with(p2p_ops)
 
+    def test_batch_isend_irecv_forwards_explicit_stream(self):
+        communicator = object.__new__(NPUCommunicator)
+        communicator.pyhccl_comm = MagicMock(disabled=False)
+        p2p_ops = [MagicMock()]
+        stream = MagicMock()
+
+        communicator.batch_isend_irecv(p2p_ops, stream=stream)
+
+        communicator.pyhccl_comm.batch_isend_irecv.assert_called_once_with(
+            p2p_ops,
+            stream=stream,
+        )
+
     def test_batch_isend_irecv_requires_pyhccl(self):
         communicator = object.__new__(NPUCommunicator)
         communicator.pyhccl_comm = None

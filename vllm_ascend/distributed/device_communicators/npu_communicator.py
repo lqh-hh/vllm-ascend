@@ -226,8 +226,11 @@ class NPUCommunicator(DeviceCommunicatorBase):
         pyhccl_comm.recv(tensor, src)
         return tensor
 
-    def batch_isend_irecv(self, p2p_ops: list) -> None:
+    def batch_isend_irecv(self, p2p_ops: list, stream=None) -> None:
         pyhccl_comm = self.pyhccl_comm
         if pyhccl_comm is None or pyhccl_comm.disabled:
             raise ValueError("No PyHccl communicator found")
-        pyhccl_comm.batch_isend_irecv(p2p_ops)
+        if stream is None:
+            pyhccl_comm.batch_isend_irecv(p2p_ops)
+        else:
+            pyhccl_comm.batch_isend_irecv(p2p_ops, stream=stream)

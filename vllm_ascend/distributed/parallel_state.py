@@ -30,6 +30,46 @@ _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
 
+# MoeDistribute V3 captures this tensor by address. Keep it separate from the
+# fault-tolerance all2all manager's elastic_info: the two mechanisms have
+# different lifecycles and are intentionally mutually exclusive for now.
+_V3_ELASTIC_INFO: torch.Tensor | None = None
+
+
+def get_v3_elastic_info() -> torch.Tensor | None:
+    return _V3_ELASTIC_INFO
+
+
+def set_v3_elastic_info(
+    elastic_info: torch.Tensor | None,
+    *,
+    allow_shape_change: bool = False,
+) -> None:
+    """Update V3 elastic metadata without invalidating captured addresses.
+
+    Same-shaped updates are copied in place. Replacing a captured tensor with
+    a differently-shaped one is only allowed after the caller has explicitly
+    released the graphs and V3 communication buffers.
+    """
+    global _V3_ELASTIC_INFO
+    if _V3_ELASTIC_INFO is None or elastic_info is None:
+        _V3_ELASTIC_INFO = elastic_info
+        return
+    if _V3_ELASTIC_INFO is elastic_info:
+        return
+    if _V3_ELASTIC_INFO.shape != elastic_info.shape:
+        if not allow_shape_change:
+            raise ValueError(
+                "Cannot change V3 elastic_info shape while captured graphs "
+                "may still reference it: "
+                f"current={tuple(_V3_ELASTIC_INFO.shape)}, "
+                f"new={tuple(elastic_info.shape)}"
+            )
+        _V3_ELASTIC_INFO = elastic_info
+        return
+    with torch.inference_mode():
+        _V3_ELASTIC_INFO.copy_(elastic_info)
+
 
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
@@ -199,6 +239,18 @@ def _replace_ascend_active_groups(
     _MC2 = mc2
 
 
+def _detach_ascend_active_groups() -> None:
+    """Drop process-local references without destroying communicators.
+
+    V3 graph-preserving scale-down keeps the original physical MC2
+    communicator alive on survivor ranks. A rank that is about to exit must
+    therefore detach its local reference instead of collectively destroying
+    that communicator.
+    """
+    global _MC2
+    _MC2 = None
+
+
 def model_parallel_initialized():
     return _ASCEND_MODEL_PARALLEL_INITIALIZED
 
@@ -273,6 +325,9 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+    global _V3_ELASTIC_INFO
+    _V3_ELASTIC_INFO = None
 
     _ASCEND_MODEL_PARALLEL_INITIALIZED = False
 

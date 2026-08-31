@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,11 +20,20 @@ def _executor_and_worker():
         world_size=2,
         data_parallel_size=2,
         data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
         data_parallel_master_ip="127.0.0.1",
+        data_parallel_master_port=29500,
+        _data_parallel_master_port_list=[29500, 29501],
         _coord_store_port=1234,
     )
     worker = SimpleNamespace(
-        vllm_config=SimpleNamespace(parallel_config=parallel_config),
+        vllm_config=SimpleNamespace(
+            parallel_config=parallel_config,
+            lora_config=None,
+        ),
     )
     executor.worker_ref = lambda: worker
     return executor, worker
@@ -35,6 +45,7 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
         new_data_parallel_size=3,
         new_data_parallel_master_ip="127.0.0.1",
         coord_store_port=1234,
+        operation_id="scale-1",
     )
 
     with (
@@ -42,6 +53,15 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
             ElasticEPScalingExecutor,
             "prepare_reconfiguration",
         ) as upstream_prepare,
+        patch.object(
+            executor,
+            "_publish_v3_capture_decision",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_dp_group",
+            return_value=SimpleNamespace(world_size=2),
+        ),
         patch(
             "vllm_ascend.distributed.elastic_ep.elastic_execute.create_ascend_standby_groups"
         ) as create_ascend_groups,
@@ -54,6 +74,7 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
         new_world_size_across_dp=6,
         master_ip="127.0.0.1",
         coord_store_port=1234,
+        create_v3_capture_dp=False,
     )
 
 
@@ -76,12 +97,13 @@ def test_receive_expert_mapping_preserves_new_upstream_return_type():
 def test_prepare_new_worker_uses_ascend_weight_transfer():
     executor, _ = _executor_and_worker()
     events = []
+    request = SimpleNamespace(operation_id="scale-2")
 
     with (
         patch.object(
             ElasticEPScalingExecutor,
             "prepare_new_worker",
-            side_effect=lambda: events.append("upstream"),
+            side_effect=lambda _: events.append("upstream"),
         ) as upstream_prepare,
         patch.object(
             executor,
@@ -92,18 +114,25 @@ def test_prepare_new_worker_uses_ascend_weight_transfer():
             "vllm_ascend.distributed.elastic_ep.elastic_execute.create_ascend_standby_groups",
             side_effect=lambda **_: events.append("ascend_mc2"),
         ) as create_ascend_groups,
+        patch.object(
+            executor,
+            "_read_v3_capture_decision",
+            return_value=False,
+        ),
     ):
-        executor.prepare_new_worker()
+        result = executor.prepare_new_worker(request)
 
     use_ascend_transfer.assert_called_once_with()
-    upstream_prepare.assert_called_once_with()
+    upstream_prepare.assert_called_once_with(request)
     create_ascend_groups.assert_called_once_with(
         new_dp_size=2,
         new_world_size_across_dp=4,
         master_ip="127.0.0.1",
         coord_store_port=1234,
+        create_v3_capture_dp=False,
     )
     assert events == ["upstream", "ascend_mc2"]
+    assert result == "scale-2"
 
 
 def test_new_worker_activates_ascend_mc2_before_commit():
@@ -127,6 +156,44 @@ def test_new_worker_activates_ascend_mc2_before_commit():
     activate_groups.assert_called_once_with()
     upstream_commit.assert_called_once_with(False)
     assert events == ["activate_mc2", "upstream_commit"]
+
+
+def test_new_worker_recovers_external_operation_id_from_store():
+    executor, _ = _executor_and_worker()
+    store = MagicMock()
+    store.check.return_value = True
+    store.get.return_value = b"scale-3"
+
+    with (
+        patch.object(
+            ElasticEPScalingExecutor,
+            "prepare_new_worker",
+        ),
+        patch.object(
+            executor,
+            "_use_ascend_transfer_impl",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute."
+            "get_cached_tcp_store_client",
+            return_value=store,
+        ),
+        patch.object(
+            executor,
+            "_read_v3_capture_decision",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute."
+            "create_ascend_standby_groups",
+        ),
+    ):
+        result = executor.prepare_new_worker()
+
+    assert result == "scale-3"
+    assert executor.reconfig_request.operation_id == "scale-3"
+    store.check.assert_called_once_with(["elastic_ep/external/current_epoch"])
 
 
 def test_switch_and_prepare_preserves_retired_groups():
@@ -212,3 +279,63 @@ def test_mc2_standby_ranks_match_dp_ep_layout():
         pcp_size=1,
         tp_size=1,
     ) == [[0, 2], [1, 3]]
+
+
+def test_v3_scale_down_uses_graph_preserving_switch():
+    executor, _ = _executor_and_worker()
+    executor.perform_scale_down_eplb_reshuffle = MagicMock()
+    executor._switch_v3_scale_down_survivor = MagicMock()
+
+    with patch.object(
+        executor,
+        "_can_preserve_v3_scale_down",
+        return_value=True,
+    ):
+        executor.commit_scale_down(new_dp_size=1, removing=False)
+
+    executor.perform_scale_down_eplb_reshuffle.assert_called_once_with(1)
+    executor._switch_v3_scale_down_survivor.assert_called_once_with(1)
+
+
+def test_non_v3_scale_down_keeps_upstream_behavior():
+    executor, _ = _executor_and_worker()
+    with (
+        patch.object(
+            executor,
+            "_can_preserve_v3_scale_down",
+            return_value=False,
+        ),
+        patch.object(
+            ElasticEPScalingExecutor,
+            "commit_scale_down",
+        ) as upstream_commit,
+    ):
+        executor.commit_scale_down(new_dp_size=1, removing=True)
+
+    upstream_commit.assert_called_once_with(1, True)
+
+
+def test_v3_graph_preserving_scale_down_rejects_async_eplb():
+    executor, worker = _executor_and_worker()
+    worker.model_runner = SimpleNamespace(
+        eplb_state=SimpleNamespace(is_async=True),
+    )
+
+    with (
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute."
+            "envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
+            True,
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_mc2_group",
+            return_value=SimpleNamespace(world_size=2),
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute."
+            "get_v3_elastic_info",
+            return_value=torch.zeros(8, dtype=torch.int32),
+        ),
+        patch.object(executor, "_current_v3_dispatchers", return_value=[object()]),
+    ):
+        assert not executor._can_preserve_v3_scale_down(new_dp_size=1)
