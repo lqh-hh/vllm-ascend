@@ -10,7 +10,6 @@ from vllm.distributed.parallel_state import (
 
 from vllm_ascend.ascend_config import get_ascend_config
 
-
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
 

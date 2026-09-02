@@ -119,9 +119,7 @@ def _assert_correct_answers(server, model_name: str, stage: str) -> None:
         completion = resp.choices[0].text
         matched = any(re.search(rf"\b{re.escape(answer)}\b", completion, re.IGNORECASE) for answer in answers)
         print(f"[{stage}][accuracy] prompt {prompt!r}: {completion!r}")
-        assert matched, (
-            f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
-        )
+        assert matched, f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
 
 
 def _make_env_dict() -> dict[str, str]:

@@ -712,8 +712,7 @@ class AscendConfig:
 
         if not getattr(vllm_config, "use_v2_model_runner", False):
             raise ValueError(
-                "Elastic EP is only supported with Model Runner V2. "
-                "Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
+                "Elastic EP is only supported with Model Runner V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
             )
 
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:

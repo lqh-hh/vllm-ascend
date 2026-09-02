@@ -146,17 +146,14 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         ):
             yield
 
-    def create_standby_groups(
-        self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
-    ) -> None:
+    def create_standby_groups(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
         # Reuse the upstream implementation to build the world / dp / ep / eplb
         # standby groups, then create the Ascend-specific MC2 standby group.
         super().create_standby_groups(reconfig_request, use_all2all)
         create_ascend_standby_groups(
             new_dp_size=reconfig_request.new_data_parallel_size,
             new_world_size_across_dp=(
-                self.worker.vllm_config.parallel_config.world_size
-                * reconfig_request.new_data_parallel_size
+                self.worker.vllm_config.parallel_config.world_size * reconfig_request.new_data_parallel_size
             ),
             master_ip=reconfig_request.new_data_parallel_master_ip,
             coord_store_port=reconfig_request.coord_store_port,
