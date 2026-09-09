@@ -1,8 +1,8 @@
 from contextlib import nullcontext
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
@@ -52,6 +52,7 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
         patch.object(
             ElasticEPScalingExecutor,
             "prepare_reconfiguration",
+            side_effect=lambda *_: setattr(executor, "_target_global_rank", 2),
         ) as upstream_prepare,
         patch.object(
             executor,
@@ -75,6 +76,7 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
         master_ip="127.0.0.1",
         coord_store_port=1234,
         create_v3_capture_dp=False,
+        new_global_rank=2,
     )
 
 
@@ -122,7 +124,7 @@ def test_prepare_new_worker_uses_ascend_weight_transfer():
     ):
         result = executor.prepare_new_worker(request)
 
-    use_ascend_transfer.assert_called_once_with()
+    use_ascend_transfer.assert_called_once_with(include_expert_weights=False)
     upstream_prepare.assert_called_once_with(request)
     create_ascend_groups.assert_called_once_with(
         new_dp_size=2,
@@ -175,8 +177,7 @@ def test_new_worker_recovers_external_operation_id_from_store():
             return_value=nullcontext(),
         ),
         patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute."
-            "get_cached_tcp_store_client",
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_cached_tcp_store_client",
             return_value=store,
         ),
         patch.object(
@@ -185,8 +186,7 @@ def test_new_worker_recovers_external_operation_id_from_store():
             return_value=False,
         ),
         patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute."
-            "create_ascend_standby_groups",
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.create_ascend_standby_groups",
         ),
     ):
         result = executor.prepare_new_worker()
@@ -241,9 +241,7 @@ def test_setup_moe_comm_refreshes_deferred_quant_group_name():
             "vllm_ascend.distributed.elastic_ep.elastic_execute.get_mc2_group",
             return_value=mc2_group,
         ),
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.setup_moe_comm_method"
-        ) as setup_moe_comm_method,
+        patch("vllm_ascend.distributed.elastic_ep.elastic_execute.setup_moe_comm_method") as setup_moe_comm_method,
     ):
         setup_moe_comm_and_quant_method(module)
 
@@ -315,7 +313,7 @@ def test_non_v3_scale_down_keeps_upstream_behavior():
     upstream_commit.assert_called_once_with(1, True)
 
 
-def test_v3_graph_preserving_scale_down_rejects_async_eplb():
+def test_v3_graph_preserving_scale_down_allows_async_eplb():
     executor, worker = _executor_and_worker()
     worker.model_runner = SimpleNamespace(
         eplb_state=SimpleNamespace(is_async=True),
@@ -323,8 +321,7 @@ def test_v3_graph_preserving_scale_down_rejects_async_eplb():
 
     with (
         patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute."
-            "envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
             True,
         ),
         patch(
@@ -332,10 +329,60 @@ def test_v3_graph_preserving_scale_down_rejects_async_eplb():
             return_value=SimpleNamespace(world_size=2),
         ),
         patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute."
-            "get_v3_elastic_info",
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_v3_elastic_info",
             return_value=torch.zeros(8, dtype=torch.int32),
         ),
         patch.object(executor, "_current_v3_dispatchers", return_value=[object()]),
     ):
-        assert not executor._can_preserve_v3_scale_down(new_dp_size=1)
+        assert executor._can_preserve_v3_scale_down(new_dp_size=1)
+
+
+@pytest.mark.parametrize(
+    "physical,active,width,expected",
+    [
+        ([0, 1, 2, 3], [0, 1, 3], 1, [0, 1, 3, 2]),
+        ([0, 1, 2, 3], [0, 1, 2], 1, [0, 1, 2, 3]),
+        ([0, 1, 3, 2], [0, 2, 3], 1, [0, 3, 2, 1]),
+        (list(range(8)), [0, 1, 3], 2, [0, 1, 2, 3, 6, 7, 4, 5]),
+    ],
+)
+def test_v3_restore_keeps_captured_mc2_rank_ids(physical, active, width, expected):
+    order = AscendElasticEPScalingExecutor._build_v3_mc2_rank_order(physical, active, width)
+    assert order == expected
+
+
+def test_v3_middle_rank_restore_publishes_capture_decision_and_mc2_order():
+    executor, worker = _executor_and_worker()
+    worker.vllm_config.parallel_config.world_size = 1
+    worker.vllm_config.parallel_config.data_parallel_size = 3
+    request = SimpleNamespace(new_data_parallel_size=4, operation_id="restore")
+    store = MagicMock()
+    values = {}
+    store.set.side_effect = values.__setitem__
+    store.get.side_effect = values.__getitem__
+    with (
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
+            True,
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_dp_group",
+            return_value=SimpleNamespace(world_size=4, dead_dp_ranks={2}),
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_mc2_group",
+            return_value=SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]),
+        ),
+        patch(
+            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_v3_elastic_info",
+            return_value=torch.tensor([1, 3, 0, 192]),
+        ),
+        patch.object(executor, "_v3_capture_store", return_value=store),
+    ):
+        assert executor._is_v3_scale_up_candidate(request)
+        assert executor._publish_v3_capture_decision(request, old_dp_size=3)
+        assert executor._v3_mc2_rank_order == [0, 1, 3, 2]
+        new_executor, _ = _executor_and_worker()
+        with patch.object(new_executor, "_v3_capture_store", return_value=store):
+            assert new_executor._read_v3_capture_decision(request)
+            assert new_executor._v3_mc2_rank_order == [0, 1, 3, 2]

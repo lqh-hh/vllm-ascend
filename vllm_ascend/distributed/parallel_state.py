@@ -4,6 +4,7 @@ from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _init_stateless_group,
+    get_ep_group,
     get_world_group,
     init_model_parallel_group,
 )
@@ -30,14 +31,45 @@ _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
 
-# MoeDistribute V3 captures this tensor by address. Keep it separate from the
-# fault-tolerance all2all manager's elastic_info: the two mechanisms have
-# different lifecycles and are intentionally mutually exclusive for now.
+# MoeDistribute V3 captures this tensor by address. Same-shaped topology
+# changes must therefore update it in place. During fault recovery the NPU
+# all2all manager supplies the new contents; during planned Elastic EP changes
+# the scaling executor supplies them.
 _V3_ELASTIC_INFO: torch.Tensor | None = None
 
 
 def get_v3_elastic_info() -> torch.Tensor | None:
     return _V3_ELASTIC_INFO
+
+
+def remap_v3_elastic_info(
+    elastic_info: torch.Tensor,
+    mc2_to_ep: list[int],
+) -> torch.Tensor:
+    """Translate EP rank tables into the physical rank order of captured MC2."""
+    world_size = len(mc2_to_ep)
+    if sorted(mc2_to_ep) != list(range(world_size)):
+        raise ValueError("MC2 rank order must be a permutation of EP ranks")
+    if elastic_info.numel() != 4 + 2 * world_size:
+        raise ValueError("V3 elastic_info size does not match MC2 rank order")
+    if mc2_to_ep == list(range(world_size)):
+        return elastic_info
+    order = torch.tensor(mc2_to_ep, dtype=torch.int64, device=elastic_info.device)
+    inverse = torch.argsort(order).to(torch.int32)
+    result = elastic_info.clone()
+    result[0] = 1
+    result[4 : 4 + world_size] = elastic_info[4 : 4 + world_size][order]
+    dense_to_ep = elastic_info[4 + world_size :]
+    result[4 + world_size :] = torch.where(dense_to_ep >= 0, inverse[dense_to_ep.clamp(min=0).long()], -1)
+    return result
+
+
+def set_v3_elastic_info_from_ep(elastic_info: torch.Tensor) -> None:
+    """Publish FT metadata without changing the EP manager's own rank tables."""
+    ep_ranks = get_ep_group().ranks
+    mc2_ranks = get_mc2_group().ranks
+    mc2_to_ep = [ep_ranks.index(rank) for rank in mc2_ranks]
+    set_v3_elastic_info(remap_v3_elastic_info(elastic_info, mc2_to_ep))
 
 
 def set_v3_elastic_info(

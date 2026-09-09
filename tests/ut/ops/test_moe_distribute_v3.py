@@ -104,8 +104,7 @@ def test_v3_dispatch_and_combine_forward_operator_arguments():
         ),
         patch.object(MoeDistributeV3Adapter, "_is_graph_mode", return_value=True),
         patch(
-            "vllm_ascend.ops.fused_moe.moe_distribute_v3."
-            "get_v3_elastic_info",
+            "vllm_ascend.ops.fused_moe.moe_distribute_v3.get_v3_elastic_info",
             return_value=elastic_info,
         ),
     ):
@@ -161,8 +160,7 @@ def test_v3_updates_buffer_context_when_elastic_info_changes():
             return_value=nullcontext(),
         ),
         patch(
-            "vllm_ascend.ops.fused_moe.moe_distribute_v3."
-            "get_v3_elastic_info",
+            "vllm_ascend.ops.fused_moe.moe_distribute_v3.get_v3_elastic_info",
             return_value=elastic_info,
         ),
     ):
@@ -175,8 +173,44 @@ def test_v3_updates_buffer_context_when_elastic_info_changes():
         )
         elastic_info[0] = 1
         assert adapter.update_ctx_to_mc2_group(mc2_group)
+        target_group = SimpleNamespace(device_group=object(), rank_in_group=0, world_size=2)
+        assert adapter.update_ctx_to_mc2_group(target_group)
+        # Serving still sees the old global group before the commit switch.
+        adapter.prepare_for_shape(
+            hidden_size=8,
+            topk=2,
+            moe_expert_num=4,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        with pytest.raises(RuntimeError, match="captured ep_rank_id"):
+            adapter.update_ctx_to_mc2_group(SimpleNamespace(device_group=object(), rank_in_group=1, world_size=2))
 
-    assert _FakeMoeDistributeBuffer.instances[0].group is device_group
+    assert len(_FakeMoeDistributeBuffer.instances) == 1
+    assert _FakeMoeDistributeBuffer.instances[0].group is target_group.device_group
+
+
+def test_v3_captured_dummy_routing_stops_even_with_permuted_or_faulted_topology():
+    adapter = MoeDistributeV3Adapter(max_tokens_per_rank=16)
+    info = torch.tensor([1, 1, 0, 2, -1, 0, 1, -1], dtype=torch.int32)
+    topk = torch.tensor([[3, 2], [2, 3]], dtype=torch.int32)
+    with patch(
+        "vllm_ascend.distributed.elastic_ep.v3_capture.get_v3_capture_session",
+        return_value=object(),
+    ):
+        adapter._remap_topk_ids_for_capture(topk, info)
+        graph = torch.jit.trace(
+            lambda ids: adapter._remap_topk_ids_for_capture(ids, info),
+            topk,
+            check_trace=False,
+        )
+    assert graph(topk).tolist() == [[0, 1], [1, 0]]
+    adapter.finish_capture()
+    # Rank translation remains enabled after commit and after subsequent FT.
+    assert info[0] == 1
+    torch.testing.assert_close(graph(topk), topk)
+    info[3] = 1
+    torch.testing.assert_close(graph(topk), topk)
 
 
 def test_dispatcher_keeps_captured_physical_expert_capacity():

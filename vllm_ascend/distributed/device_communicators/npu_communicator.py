@@ -107,7 +107,7 @@ class _NpuAll2AllManager:
         return self._elastic_info
 
     def set_num_physical_experts(self, num_physical_experts: int) -> None:
-        """Shrink the expert-space width after scale-down and rebuild."""
+        """Set the active expert-space width and rebuild elastic_info."""
         self._num_physical_experts = num_physical_experts
         self._rebuild_elastic_info()
 
@@ -123,7 +123,19 @@ class _NpuAll2AllManager:
         table2[: len(alive)] = torch.tensor(alive, dtype=torch.int32)
         self._elastic_info_host.copy_(
             torch.cat(
-                [torch.tensor([1, len(alive), 0, self._num_physical_experts], dtype=torch.int32), table1, table2]
+                [
+                    torch.tensor(
+                        [
+                            int(bool(self._dead)),
+                            len(alive),
+                            0,
+                            self._num_physical_experts,
+                        ],
+                        dtype=torch.int32,
+                    ),
+                    table1,
+                    table2,
+                ]
             )
         )
         if self._elastic_info is not None:

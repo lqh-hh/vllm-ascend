@@ -37,6 +37,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
     get_v3_elastic_info,
     set_v3_elastic_info,
+    set_v3_elastic_info_from_ep,
 )
 from vllm_ascend.lora.fused_moe import (
     all2all_lora_indices,
@@ -53,8 +54,8 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
     MoETokenDispatchOutput,
     TMoECombineMetadata,
 )
-from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.ops.fused_moe.moe_distribute_v3 import MoeDistributeV3Adapter
+from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -157,29 +158,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._ft_enabled = vllm_config.parallel_config.enable_fault_tolerance
         self._initial_v3_moe_expert_num: int | None = None
         if self._ft_enabled and self.mc2_comm_alg == "hierarchy":
-            raise RuntimeError(
-                "MC2 fault tolerance (elastic_info) is mutually exclusive "
-                "with comm_alg='hierarchy'."
-            )
+            raise RuntimeError("MC2 fault tolerance (elastic_info) is mutually exclusive with comm_alg='hierarchy'.")
         self._use_moe_distribute_v3 = envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
         self.v3_adapter: MoeDistributeV3Adapter | None = None
         if self._use_moe_distribute_v3:
             if get_ascend_device_type() != AscendDeviceType.A3:
-                raise RuntimeError(
-                    "MoeDistribute V3 is currently supported only on Ascend A3."
-                )
-            if self._ft_enabled:
-                raise RuntimeError(
-                    "MoeDistribute V3 external Elastic EP and MC2 fault "
-                    "tolerance cannot be enabled together yet."
-                )
+                raise RuntimeError("MoeDistribute V3 is currently supported only on Ascend A3.")
             if self.mc2_comm_alg == "hierarchy":
-                raise RuntimeError(
-                    "MoeDistribute V3 does not support comm_alg='hierarchy'."
-                )
-            self.v3_adapter = MoeDistributeV3Adapter(
-                self.max_num_tokens_per_rank
-            )
+                raise RuntimeError("MoeDistribute V3 does not support comm_alg='hierarchy'.")
+            self.v3_adapter = MoeDistributeV3Adapter(self.max_num_tokens_per_rank)
 
     def refresh_hccl_group(self) -> None:
         """Refresh MC2 communicator metadata after HCCL groups are recreated."""
@@ -196,6 +183,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         device: torch.device,
     ) -> None:
         if get_v3_elastic_info() is not None:
+            return
+        if self._ft_enabled:
+            # Share the exact tensor owned by the FT all2all manager. V3 graph
+            # capture records its address, while update_mask() and expert
+            # redistribution mutate its contents in place after a failure.
+            manager = get_ep_all2all_manager()
+            manager.set_num_physical_experts(moe_expert_num)
+            set_v3_elastic_info_from_ep(manager.get_elastic_info())
             return
         rank_table = torch.arange(
             self.ep_world_size,
@@ -221,12 +216,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ) -> int:
         expert_map = token_dispatch_input.routing.expert_map
-        assert expert_map is not None, (
-            "expert_map is required for MC2 token dispatch."
-        )
-        return len(expert_map) + (
-            token_dispatch_input.routing.global_redundant_expert_num
-        )
+        assert expert_map is not None, "expert_map is required for MC2 token dispatch."
+        return len(expert_map) + (token_dispatch_input.routing.global_redundant_expert_num)
 
     def _get_dispatch_quant_mode(
         self,
@@ -340,9 +331,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         if self.v3_adapter is not None:
-            current_moe_expert_num = self._get_moe_expert_num(
-                token_dispatch_input
-            )
+            current_moe_expert_num = self._get_moe_expert_num(token_dispatch_input)
             self._ensure_v3_identity_elastic_info(
                 current_moe_expert_num,
                 token_dispatch_input.hidden_states.device,

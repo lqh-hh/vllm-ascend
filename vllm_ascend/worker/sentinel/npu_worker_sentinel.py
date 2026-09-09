@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 import torch_npu
@@ -13,9 +14,13 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
     WorkerSentinel as GPUWorkerSentinel,
 )
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
-from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.parallel_state import (
+    get_mc2_group,
+    set_v3_elastic_info_from_ep,
+)
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_local_reload_plan,
     build_orig_to_dense_rank_table,
@@ -34,7 +39,7 @@ if TYPE_CHECKING:
 
 
 def fault_barrier_wrapper(func: Callable):
-    """Quarantine and reset the worker when a wrapped method faults."""
+    """Quarantine and reset the worker, then propagate its first fault."""
 
     def wrapped(self, *args, **kwargs):
         sentinel = getattr(self, "worker_sentinel", None)
@@ -52,7 +57,10 @@ def fault_barrier_wrapper(func: Callable):
                     sentinel.reset_device()
                 except Exception:
                     logger.exception("[FT] self device reset failed on worker %d.", self.rank)
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                # The executor must receive the original failure so EngineCore
+                # transitions surviving ranks to UNHEALTHY. Returning an empty
+                # output here reports SUCCESS and hides peer/collective faults.
+                raise
             raise
 
     return wrapped
@@ -158,7 +166,9 @@ class WorkerSentinel(GPUWorkerSentinel):
             raise ValueError(
                 "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
             )
-        if not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+        if not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3 and not hasattr(
+            torch_npu, "npu_moe_distribute_dispatch_v2"
+        ):
             raise ValueError(
                 "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
@@ -212,7 +222,7 @@ class WorkerSentinel(GPUWorkerSentinel):
 
         # Shrink the physical-expert width to the surviving slots; this also
         # flips elastic_info into scaling-down mode.
-        get_ep_all2all_manager().set_num_physical_experts((ep_world_size - len(dead_ep_ranks)) * num_local_experts)
+        self._update_elastic_info((ep_world_size - len(dead_ranks)) * num_local_experts)
 
         logger.info(
             "[FT] Expert redistribution: num_logical=%d, ep_world_size=%d, num_local_experts=%d, reloaded_slots=%s",
@@ -221,3 +231,17 @@ class WorkerSentinel(GPUWorkerSentinel):
             num_local_experts,
             sum(len(v) for v in reload_plan.values()),
         )
+
+    @staticmethod
+    def _update_elastic_info(num_physical_experts: int) -> None:
+        """Publish the FT topology to both MC2 implementations.
+
+        V2 reads the all2all manager directly. V3 normally shares that same
+        tensor from initial graph capture; copying through the V3 setter also
+        covers a manager replaced by a prior planned Elastic EP operation and
+        preserves the address captured by existing graphs.
+        """
+        manager = get_ep_all2all_manager()
+        manager.set_num_physical_experts(num_physical_experts)
+        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+            set_v3_elastic_info_from_ep(manager.get_elastic_info())
