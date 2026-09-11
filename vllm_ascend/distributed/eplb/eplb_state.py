@@ -271,21 +271,28 @@ class AscendEplbState(_eplb_state.EplbState):
         self._load_stats_window_start_index = 0
         self._load_stats_window_write_index = 0
 
+    def update_mapping(self, model_config, expanded_physical_to_logical: torch.Tensor) -> None:
+        super().update_mapping(model_config, expanded_physical_to_logical)
+        refresh_model_routing_tables(self.model_states[model_config.compute_hash()])
+
     def get_rank_node_ids(self) -> np.ndarray:
         """Return cached node ordinals in stage-local EPLB rank order."""
         rank_node_ids = getattr(self, "_rank_node_ids", None)
         if rank_node_ids is not None:
             return rank_node_ids
 
-        cpu_group = get_eplb_group().cpu_group
-        num_ranks = cpu_group.size()
+        eplb_group = get_eplb_group()
+        node_group = getattr(eplb_group, "tcp_store_group", None)
+        if node_group is None:
+            node_group = eplb_group.cpu_group
+        num_ranks = eplb_group.cpu_group.size()
         rank_node_ids = np.full(num_ranks, -1, dtype=np.int64)
         next_node_id = 0
         for source_rank in range(num_ranks):
             if rank_node_ids[source_rank] >= 0:
                 continue
             same_node = np.asarray(
-                in_the_same_node_as(cpu_group, source_rank),
+                in_the_same_node_as(node_group, source_rank),
                 dtype=bool,
             )
             if same_node.shape != (num_ranks,) or not same_node[source_rank]:

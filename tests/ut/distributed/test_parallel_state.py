@@ -178,6 +178,7 @@ def test_kvpp_group_stays_inside_pipeline_stage(monkeypatch, size, pcp_size):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
     parallel_state.init_ascend_model_parallel(
         SimpleNamespace(
+            enable_elastic_ep=False,
             tensor_parallel_size=4 // pcp_size,
             pipeline_parallel_size=2,
             data_parallel_size=1,
@@ -229,6 +230,7 @@ def test_engram_dp_pcp_group_reuses_upstream_node_partition(monkeypatch, shared,
     monkeypatch.setattr(parallel_state, "get_ascend_config", lambda: config)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
     topology = SimpleNamespace(
+        enable_elastic_ep=False,
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         data_parallel_size=2,
