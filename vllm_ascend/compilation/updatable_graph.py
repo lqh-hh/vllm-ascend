@@ -163,11 +163,22 @@ class UpdatableGraph(torch.npu.NPUGraph):
         self,
         update_stream,
         resolved_tasks: tuple[GraphUpdateTask, ...],
+        *,
+        trace: bool = False,
     ) -> None:
         logger.debug_once("Updating host-side attention metadata with UpdatableGraph.")
         with torch.npu.stream(update_stream):
-            for task in resolved_tasks:
+            for index, task in enumerate(resolved_tasks):
+                if trace:
+                    logger.info(
+                        "[FT_REPLAY] task.begin index=%d/%d layer=%s",
+                        index + 1,
+                        len(resolved_tasks),
+                        getattr(task.provider, "layer_name", None),
+                    )
                 task.apply(update_stream)
+                if trace:
+                    logger.info("[FT_REPLAY] task.submitted index=%d/%d", index + 1, len(resolved_tasks))
 
 
 def register_task(
