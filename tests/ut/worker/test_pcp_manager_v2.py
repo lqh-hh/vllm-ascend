@@ -252,7 +252,7 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
             return_value=torch.zeros(2, dtype=torch.int64),
         ),
         patch(
-            "vllm.v1.worker.gpu.pcp_manager.async_copy_to_gpu",
+            "vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d",
             side_effect=_mock_async_copy_to_cpu,
         ),
         patch(
@@ -396,7 +396,7 @@ def test_partition_batch_pads_decode_requests_when_tokens_are_already_padded():
             return_value=local_attn_state,
         ) as build_attn_state,
         patch(
-            "vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu",
+            "vllm_ascend.worker.v2.pcp_manager.async_tensor_h2d",
             side_effect=_mock_async_copy_to_cpu,
         ),
     ):
@@ -590,11 +590,11 @@ def test_partition_batch_preserves_fia_dummy_layout() -> None:
             return_value=torch.zeros(1, dtype=torch.int64),
         ),
         patch(
-            "vllm.v1.worker.gpu.pcp_manager.async_copy_to_gpu",
+            "vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d",
             side_effect=_mock_async_copy_to_cpu,
         ),
         patch(
-            "vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu",
+            "vllm_ascend.worker.v2.pcp_manager.async_tensor_h2d",
             side_effect=_mock_async_copy_to_cpu,
         ),
         patch(
@@ -1004,7 +1004,7 @@ def test_partition_batch_clears_padded_dcp_local_seq_lens() -> None:
             return_value=object(),
         ),
         patch(
-            "vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu",
+            "vllm_ascend.worker.v2.pcp_manager.async_tensor_h2d",
             side_effect=_mock_async_copy_to_cpu,
         ),
     ):

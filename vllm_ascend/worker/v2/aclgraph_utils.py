@@ -127,6 +127,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         model_runner: Any,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        ubatch_runner: Any = None,
     ):
         super().__init__(
             vllm_config,
@@ -135,6 +136,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
+            ubatch_runner=ubatch_runner,
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner

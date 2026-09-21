@@ -222,7 +222,7 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
     assert runner.execute_model_state is restored_state
 
 
-def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_padding():
+def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_descriptor():
     source_path = Path(__file__).parents[3] / "vllm_ascend" / "worker" / "v2" / "model_runner.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     padding_assignments = [
@@ -240,20 +240,14 @@ def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_padding():
     ]
 
     # prepare_inputs keeps the real global PCP batch when it is larger than the
-    # graph descriptor, and forwards the descriptor as an explicit rank-local
-    # padded extent on both supported versions (upstream vLLM #53515).
+    # graph descriptor and forwards the descriptor to the current PCP API.
     assert len(padding_assignments) == 1
     assert ast.unparse(padding_assignments[0].value) == "max(num_tokens, batch_desc.num_tokens)"
 
     assert len(partition_calls) == 1
-    padded_call = next(
-        call for call in partition_calls if any(keyword.arg == "padded_num_tokens" for keyword in call.keywords)
-    )
-    padded_num_tokens = next(keyword.value for keyword in padded_call.keywords if keyword.arg == "padded_num_tokens")
-    assert isinstance(padded_num_tokens, ast.Attribute)
-    assert padded_num_tokens.attr == "num_tokens"
-    assert isinstance(padded_num_tokens.value, ast.Name)
-    assert padded_num_tokens.value.id == "batch_desc"
+    partition_call = partition_calls[0]
+    assert len(partition_call.args) == 3
+    assert ast.unparse(partition_call.args[2]) == "batch_desc"
 
 
 @pytest.mark.parametrize("num_reqs,num_tokens", [(4, 4), (2, 6)])
@@ -695,11 +689,11 @@ def _fake_async_copy(src, device=None, out=None):
 def _run_prepare_inputs(runner, scheduler_output, batch_req_state, batch_desc, *, version_029=False):
     batch = SimpleNamespace(positions=torch.zeros(4, dtype=torch.int32))
 
-    def _partition(_pcp_manager, input_batch, **_kwargs):
+    def _partition(_pcp_manager, input_batch, _batch_desc):
         return input_batch
 
     with (
-        patch("vllm_ascend.worker.v2.model_runner.async_copy_to_gpu", side_effect=_fake_async_copy),
+        patch("vllm_ascend.worker.v2.model_runner.async_tensor_h2d", side_effect=_fake_async_copy),
         patch("vllm_ascend.worker.v2.model_runner.build_attn_state", return_value="attn"),
         patch("vllm_ascend.worker.v2.model_runner.prepare_prefill_inputs"),
         patch("vllm_ascend.worker.v2.model_runner.prepare_pos_seq_lens"),

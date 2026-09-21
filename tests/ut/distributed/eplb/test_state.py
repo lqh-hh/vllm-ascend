@@ -189,11 +189,15 @@ def test_from_mapping_requires_release_valid_expert_count(monkeypatch):
         )
 
 
-def test_init_sets_cuda_device_index_for_npu(monkeypatch):
+@pytest.mark.parametrize("explicit_index,expected", [(None, 5), (0, 0), (3, 3)])
+def test_init_sets_upstream_device_index_for_npu(monkeypatch, explicit_index, expected):
     parallel_config = MagicMock()
-    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 5)
-    monkeypatch.setattr(torch.cuda, "Event", torch.npu.Event)
+    current_device_index = MagicMock(return_value=5)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", current_device_index)
+    monkeypatch.setattr(upstream_eplb_state, "CpuGpuEvent", MagicMock())
 
-    state = AscendEplbState(parallel_config, torch.device("cpu"))
+    # Run the real upstream constructor without allocating an NPU event.
+    state = AscendEplbState(parallel_config, SimpleNamespace(type="npu", index=explicit_index))
 
-    assert state.cuda_device_index == 5
+    assert state.device_index == expected
+    assert current_device_index.call_count == (1 if explicit_index is None else 0)

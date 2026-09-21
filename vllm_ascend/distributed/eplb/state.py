@@ -93,13 +93,13 @@ def refresh_model_routing_tables(
 class AscendEplbState(_eplb_state.EplbState):
     """Keep Ascend routing and load-recording state around upstream EPLB."""
 
-    cuda_device_index: int | None
-
     def __init__(self, parallel_config, device: torch.device) -> None:
         super().__init__(parallel_config, device)
         self._has_fresh_recorded_load = False
-        if self.cuda_device_index is None:
-            self.cuda_device_index = torch.accelerator.current_device_index()
+        if self.device_index is None:
+            self.device_index = device.index
+            if self.device_index is None:
+                self.device_index = torch.accelerator.current_device_index()
 
     def _has_global_fresh_recorded_load(self) -> bool:
         """Synchronize whether any EP rank recorded load since rearranging."""

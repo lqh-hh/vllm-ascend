@@ -23,8 +23,8 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pcp_group, get_pp_group
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -323,7 +323,7 @@ class AscendPCPManager(PCPManager):
             # FULL-graph query layout is also the authoritative rank-local
             # layout, including any FIA dummy request.
             graph_query_start_loc_np = global_batch.query_start_loc_np[: graph_num_reqs + 1]
-            async_copy_to_gpu(
+            async_tensor_h2d(
                 graph_query_start_loc_np,
                 out=input_buffers.query_start_loc[: graph_num_reqs + 1],
             )
