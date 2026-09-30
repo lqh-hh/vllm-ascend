@@ -54,6 +54,16 @@ class _NpuAll2AllManager:
         self._device = device
         self._elastic_info: torch.Tensor | None = None
 
+    def stage_ep_size(self) -> None:
+        # Ascend stages communication groups in AscendElasticEPScalingExecutor;
+        # this mask manager has no connections to stage.
+        pass
+
+    def commit_ep_size(self) -> None:
+        # The Ascend executor switches groups and updates backend masks.
+        # Keep the upstream default no-op here to avoid changing them twice.
+        pass
+
     @property
     def uses_mega_moe(self) -> bool:
         return self._mega_moe_buffer is not None
