@@ -541,7 +541,7 @@ class TestNPUPlatform(TestBase):
             vllm_config.parallel_config.eplb_config.communicator,
         )
 
-    def test_validate_eplb_config_async_rejects_elastic_ep(self):
+    def test_validate_eplb_config_async_elastic_ep_uses_gloo(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
         vllm_config.parallel_config.enable_eplb = True
@@ -551,8 +551,9 @@ class TestNPUPlatform(TestBase):
             communicator=None,
         )
 
-        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ValueError, "elastic EP"):
+        with patch.dict("os.environ", {}, clear=True):
             _validate_eplb_config(vllm_config)
+        self.assertEqual(vllm_config.parallel_config.eplb_config.communicator, "torch_gloo")
 
     def test_validate_eplb_config_async_rejects_nccl_communicator(self):
         vllm_config = self.mock_vllm_config()
@@ -1063,6 +1064,8 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertFalse(kwargs["in_profile_run"])
+        self.assertIs(kwargs["use_mega_moe"], True)
+        self.assertIs(kwargs["is_decode_only_node"], False)
         self.assertEqual(kwargs["padded_num_tokens"], 8)
         self.assertEqual(kwargs["max_tokens_across_pcp"], 5)
         self.assertIs(kwargs["moe_comm_method"], dummy_comm_method)
@@ -1126,6 +1129,8 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertTrue(kwargs["in_profile_run"])
+        self.assertIs(kwargs["use_mega_moe"], False)
+        self.assertIs(kwargs["is_decode_only_node"], False)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")

@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import scale_from_float_to_int64
 from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
     _WANTED_SUFFIXES,
     _WEIGHT_ATTRS,
@@ -180,6 +181,17 @@ def _reload_chunk(
         layer, slot = routed_layers[layer_expert[0]], local_slots[layer_expert]
         for attr in device_tensors:
             _slot_tensor(layer, attr, slot).copy_(device_tensors[attr][i], non_blocking=True)
+        if "w13_weight_scale_fp32" in device_tensors:
+            for packed_attr, scale_attr in (
+                ("fused_w1_scale", "w13_weight_scale_fp32"),
+                ("fused_w2_scale", "w2_weight_scale"),
+            ):
+                packed = getattr(layer, f"{packed_attr}_list", None)
+                if packed is None:
+                    packed = getattr(layer, f"cann_mega_moe_{packed_attr}_list", None)
+                if packed is not None:
+                    # Reload the packed scales consumed by MegaMoe in the same slot.
+                    packed[slot].copy_(scale_from_float_to_int64(per_expert[i][scale_attr]), non_blocking=True)
     torch.npu.synchronize()
     return len(layer_experts)
 
