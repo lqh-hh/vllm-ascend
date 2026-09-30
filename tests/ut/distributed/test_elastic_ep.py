@@ -33,6 +33,7 @@ def _executor_and_worker():
         _coord_store_port=1234,
     )
     worker = SimpleNamespace(
+        get_model=lambda: SimpleNamespace(modules=lambda: []),
         vllm_config=SimpleNamespace(
             parallel_config=parallel_config,
             lora_config=None,
@@ -532,6 +533,23 @@ def test_v3_middle_rank_restore_publishes_capture_decision_and_mc2_order():
             assert new_executor._v3_mc2_rank_order == [0, 1, 3, 2]
 
 
+def test_elastic_comm_lookup_uses_each_layer_shape(monkeypatch):
+    from vllm_ascend.ops.fused_moe import moe_comm_method as methods
+
+    executor, worker = _executor_and_worker()
+    configs = [
+        SimpleNamespace(num_experts=256, num_local_experts=64),
+        SimpleNamespace(num_experts=512, num_local_experts=128),
+    ]
+    layers = [SimpleNamespace(moe_config=config) for config in [configs[0], configs[0], configs[1]]]
+    worker.get_model = lambda: SimpleNamespace(modules=lambda: layers)
+    monkeypatch.setattr("vllm_ascend.distributed.elastic_ep.elastic_execute.is_moe_layer", lambda _: True)
+    first, second = object(), object()
+    kind = methods.MoECommType.FUSED_MC2
+    monkeypatch.setattr(methods, "_MoECommMethods", {(kind, (256, 64)): first, (kind, (512, 128)): second})
+    assert executor._moe_comm_methods(kind) == [first, second]
+
+
 def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
     executor, worker = _executor_and_worker()
     parallel = worker.vllm_config.parallel_config
@@ -544,7 +562,7 @@ def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
         token_dispatcher=SimpleNamespace(refresh_hccl_group=MagicMock()),
     )
     module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
-    monkeypatch.setattr(f"{module}.get_moe_comm_method", lambda kind: comm)
+    monkeypatch.setattr(executor, "_moe_comm_methods", lambda kind: [comm])
     monkeypatch.setattr(f"{module}.get_dp_group", lambda: SimpleNamespace(world_size=4, dead_dp_ranks=set(dead_ranks)))
     monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]))
     monkeypatch.setattr(f"{module}.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", False)
@@ -672,6 +690,7 @@ def test_new_mega_worker_masks_existing_slots_before_capture(monkeypatch):
     module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
     monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(ranks=[0, 1, 3, 2]))
     monkeypatch.setattr(f"{module}._is_decode_only_node", lambda config: False)
+    monkeypatch.setattr(f"{module}.get_moe_comm_method", lambda kind, config: comm)
     monkeypatch.setattr(executor, "_setup_moe_comm_and_quant_method", MagicMock())
     rendezvous = MagicMock(side_effect=lambda *args: bool(state.capture_active) or pytest.fail("routing not ready"))
     monkeypatch.setattr(executor, "_synchronize_v3_context_rendezvous", rendezvous)
