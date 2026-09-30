@@ -28,6 +28,7 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import use_cann_megamoe
 from vllm_ascend.distributed.eplb.eplb_state import refresh_model_routing_tables
 from vllm_ascend.distributed.parallel_state import (
     set_v3_elastic_info_from_ep,
@@ -128,6 +129,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         # base flow and lift the quarantine after the groups are rebuilt.
         self.reset_device()
         super().retry(ft_request)
+        if use_cann_megamoe(self.worker.vllm_config):
+            # Publish buffer cleanup and mask writes before any graph replay
+            # on a different stream.
+            torch.npu.synchronize()
         self.worker_faulted = False
 
     def init_num_local_experts(self) -> None:
@@ -178,7 +183,10 @@ class WorkerSentinel(GPUWorkerSentinel):
             )
         self._resolve_drafter()
         ascend_config = get_ascend_config()
-        if ascend_config.enable_fused_mc2:
+        mega_moe = use_cann_megamoe(self.worker.vllm_config)
+        if mega_moe and not get_ep_all2all_manager().uses_mega_moe:
+            raise ValueError("[FT] MegaMoe scale_down requires a fault-tolerance buffer initialized during warmup.")
+        if ascend_config.enable_fused_mc2 and not mega_moe and not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
             raise ValueError(
                 "[FT] scale_down is not supported with enable_fused_mc2: the "
                 "fused dispatch_ffn_combine operators take no elastic_info."
@@ -187,8 +195,10 @@ class WorkerSentinel(GPUWorkerSentinel):
             raise ValueError(
                 "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
             )
-        if not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3 and not hasattr(
-            torch_npu, "npu_moe_distribute_dispatch_v2"
+        if (
+            not mega_moe
+            and not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
+            and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
         ):
             raise ValueError(
                 "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
@@ -261,9 +271,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         if reassignments:
             reload_experts_from_disk(model, model_path, reassignments)
         refresh_model_routing_tables(model_state)
-        self._densify_routing_tables(model_state)
-        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
-            set_v3_elastic_info_from_ep(get_ep_all2all_manager().get_elastic_info())
+        if not get_ep_all2all_manager().uses_mega_moe:
+            self._densify_routing_tables(model_state)
+            if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+                set_v3_elastic_info_from_ep(get_ep_all2all_manager().get_elastic_info())
 
     def _resolve_drafter(self) -> tuple[torch.nn.Module, EplbModelState, str] | None:
         """Resolve a drafter's EPLB state and checkpoint, rejecting unregistered MoE."""
