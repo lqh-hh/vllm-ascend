@@ -95,16 +95,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
-    # Whether to use MoeDistribute V3 low-latency dispatch/combine for the
-    # MC2 MoE communication path. 0 (default): disabled; 1: enabled. This is
-    # currently supported on Ascend A3 for external Elastic EP validation.
-    # Valid values are 0 and 1; not sensitive.
-    "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0"))),
     # Diagnose the first MRV2 full-graph replay after each FT device reset.
     # 0 (default): off; 1: host-stage logs; 2: also synchronize the update
     # and compute streams after all graph updates have been submitted.
-    # Both enabled levels also snapshot V3 context at construction/recovery
-    # boundaries (device reads only after reset or before graph execution).
     # Diagnostics change timing. Logs include runtime addresses, not weights.
     "VLLM_ASCEND_FT_REPLAY_DEBUG": _ft_replay_debug_level,
 }

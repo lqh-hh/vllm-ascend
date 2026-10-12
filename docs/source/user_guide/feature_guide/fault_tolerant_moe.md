@@ -1,24 +1,15 @@
 # Fault-tolerant MoE on Ascend A3
 
-The v2 model runner supports fault-tolerance `scale_down` with either
-MoeDistribute V3 or CANN MegaMoe. Choose the backend when starting every worker;
-changing environment variables on an already running worker does not switch
-its loaded weights, communication buffers, or captured graphs.
+This branch provides CANN MegaMoe fault scale-down and restore expansion.
+Start every worker with `--additional-config '{"enable_fused_mc2": 2}'`.
+Mode `1` selects the legacy fused operator; mode `2` opts into CANN MegaMoe
+and is normalized to `1` internally. MoeDistribute V3 is not included.
 
-| Backend | Environment | Additional configuration |
-| --- | --- | --- |
-| MoeDistribute V3 | `VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3=1` | `{"enable_fused_mc2": 0}` |
-| CANN MegaMoe | `VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3=0` | `{"enable_fused_mc2": 2}` |
-
-V3 retains priority if its environment switch is enabled. Mode `1` is the
-legacy fused operator, which does not support fault-tolerance scale-down.
-This branch normalizes mode `2` to `1` internally after enabling CANN MegaMoe;
-use the values in the table on the command line.
-
-Both backends require `VLLM_USE_V2_MODEL_RUNNER=1`, `--enable-expert-parallel`,
+MegaMoe requires `VLLM_USE_V2_MODEL_RUNNER=1`, `--enable-expert-parallel`,
 `--enable-fault-tolerance`, `--enable-eplb`, and enough redundant expert slots
 to host every logical expert on the surviving ranks. Disable hierarchical
-MC2 communication. All workers must use the same backend and compatible packages.
+MC2 communication. All workers must use the same backend, branch and compatible
+packages, including newly launched ranks.
 
 ## MegaMoe requirements
 
@@ -32,8 +23,8 @@ MC2 communication. All workers must use the same backend and compatible packages
   The unmodified Qwen3-30B-A3B checkpoint has a 768-wide MoE intermediate
   dimension, which is not aligned to 512. It requires an operator build that
   explicitly supports this shape, such as the local A3 W8A8 768 exception;
-  unmodified operators still reject it. Explicit MegaMoe fault-tolerance
-  requests fail at startup for unsupported models instead of falling back.
+  unmodified operators still reject it. This branch retains the
+  temporary model-configuration bypass for that local operator build.
 - The existing expert reloaders support unquantized and W8A8 dynamic experts.
   Ordinary MegaMoe support for other quantization formats does not imply
   fault-tolerance reload support for those formats.
@@ -49,8 +40,7 @@ The fault manager keeps a CPU record of dead ranks for fault queries, so
 querying a hung device is unnecessary. During recovery it updates the same
 device mask storage captured by the graph. MegaMoe retains the original
 physical expert capacity and ids; EPLB moves lost experts into surviving slots
-and reloads their weights and packed scales in place. V3 continues to use its
-existing dense expert ids and `elastic_info`.
+and reloads their weights and packed scales in place.
 
 After device reset, MegaMoe communication flags are cleared before inference
 resumes, while cumulative dead-rank masks are preserved. Unmasking a rank
@@ -106,4 +96,4 @@ pytest -sv tests/e2e/pull_request/four_card/fault_tolerance/test_fault_tolerance
 
 The default Qwen3 model is skipped for MegaMoe because of its intermediate
 dimension. A skipped hardware test is not evidence of successful recovery or
-accuracy; validate both backends on the target CANN build before deployment.
+accuracy; validate MegaMoe on the target CANN build before deployment.
