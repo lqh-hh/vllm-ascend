@@ -35,14 +35,6 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
-def _ft_replay_debug_level() -> int:
-    name = "VLLM_ASCEND_FT_REPLAY_DEBUG"
-    value = os.getenv(name, "0")
-    if value not in {"0", "1", "2"}:
-        raise ValueError(f"{name} must be '0', '1', or '2', got {value!r}")
-    return int(value)
-
-
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -95,11 +87,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
-    # Diagnose the first MRV2 full-graph replay after each FT device reset.
-    # 0 (default): off; 1: host-stage logs; 2: also synchronize the update
-    # and compute streams after all graph updates have been submitted.
-    # Diagnostics change timing. Logs include runtime addresses, not weights.
-    "VLLM_ASCEND_FT_REPLAY_DEBUG": _ft_replay_debug_level,
 }
 
 # end-env-vars-definition

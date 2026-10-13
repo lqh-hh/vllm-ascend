@@ -151,26 +151,17 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
     )
 
 
-def test_receive_expert_mapping_preserves_new_upstream_return_type():
-    executor, _ = _executor_and_worker()
-    mapping = torch.tensor([[0, 1]])
-    executor._setup_moe_comm_and_quant_method = MagicMock()
-
-    with patch.object(
-        ElasticEPScalingExecutor,
-        "receive_expert_mapping",
-        return_value=mapping,
-    ):
-        result = executor.receive_expert_mapping()
-
-    assert result is mapping
-    executor._setup_moe_comm_and_quant_method.assert_called_once_with()
-
-
-def test_prepare_new_worker_uses_ascend_weight_transfer():
+@pytest.mark.parametrize("bootstrap_request", [False, True])
+def test_prepare_new_worker_uses_ascend_weight_transfer(monkeypatch, bootstrap_request):
     executor, _ = _executor_and_worker()
     events = []
     request = SimpleNamespace(operation_id="scale-2")
+    store = MagicMock()
+    store.check.return_value = True
+    store.get.return_value = b"scale-2"
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.elastic_ep.elastic_execute.get_cached_tcp_store_client", lambda *_: store
+    )
 
     with (
         patch.object(
@@ -193,10 +184,11 @@ def test_prepare_new_worker_uses_ascend_weight_transfer():
             return_value=False,
         ),
     ):
-        result = executor.prepare_new_worker(request)
+        result = executor.prepare_new_worker(None if bootstrap_request else request)
 
     use_ascend_transfer.assert_called_once_with(include_expert_weights=False)
-    upstream_prepare.assert_called_once_with(request)
+    resolved_request = executor.reconfig_request if bootstrap_request else request
+    upstream_prepare.assert_called_once_with(resolved_request)
     create_ascend_groups.assert_called_once_with(
         new_dp_size=2,
         new_world_size_across_dp=4,
@@ -206,6 +198,9 @@ def test_prepare_new_worker_uses_ascend_weight_transfer():
     )
     assert events == ["upstream", "ascend_mc2"]
     assert result == "scale-2"
+    assert resolved_request.operation_id == "scale-2"
+    if bootstrap_request:
+        store.check.assert_called_once_with(["elastic_ep/external/current_epoch"])
 
 
 def test_new_worker_activates_ascend_mc2_before_commit():
@@ -229,42 +224,6 @@ def test_new_worker_activates_ascend_mc2_before_commit():
     activate_groups.assert_called_once_with()
     upstream_commit.assert_called_once_with(False)
     assert events == ["activate_mc2", "upstream_commit"]
-
-
-def test_new_worker_recovers_external_operation_id_from_store():
-    executor, _ = _executor_and_worker()
-    store = MagicMock()
-    store.check.return_value = True
-    store.get.return_value = b"scale-3"
-
-    with (
-        patch.object(
-            ElasticEPScalingExecutor,
-            "prepare_new_worker",
-        ),
-        patch.object(
-            executor,
-            "_use_ascend_transfer_impl",
-            return_value=nullcontext(),
-        ),
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_cached_tcp_store_client",
-            return_value=store,
-        ),
-        patch.object(
-            executor,
-            "_read_capture_decision",
-            return_value=False,
-        ),
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.create_ascend_standby_groups",
-        ),
-    ):
-        result = executor.prepare_new_worker()
-
-    assert result == "scale-3"
-    assert executor.reconfig_request.operation_id == "scale-3"
-    store.check.assert_called_once_with(["elastic_ep/external/current_epoch"])
 
 
 def test_switch_and_prepare_retires_previous_mc2_group():
@@ -291,34 +250,6 @@ def test_switch_and_prepare_retires_previous_mc2_group():
 
     assert result == (*retired_groups, replace_groups.return_value)
     replace_groups.assert_called_once_with(mc2=standby_mc2)
-
-
-def test_setup_moe_comm_refreshes_deferred_quant_group_name():
-    backend = MagicMock()
-    backend.get_hccl_comm_name.return_value = "new-mc2-group"
-    device_group = MagicMock()
-    device_group._get_backend.return_value = backend
-    mc2_group = SimpleNamespace(device_group=device_group, rank_in_group=3)
-    quant_method = SimpleNamespace(moe_all_to_all_group_name="")
-    module = SimpleNamespace(
-        routed_experts=SimpleNamespace(
-            quant_method=SimpleNamespace(quant_method=quant_method),
-        ),
-        moe_config=MagicMock(),
-    )
-
-    with (
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_mc2_group",
-            return_value=mc2_group,
-        ),
-        patch("vllm_ascend.distributed.elastic_ep.elastic_execute.setup_moe_comm_method") as setup_moe_comm_method,
-    ):
-        setup_moe_comm_and_quant_method(module)
-
-    assert quant_method.moe_all_to_all_group_name == "new-mc2-group"
-    backend.get_hccl_comm_name.assert_called_once_with(3)
-    setup_moe_comm_method.assert_called_once_with(module.moe_config)
 
 
 @pytest.mark.parametrize("has_quant_group_name", [True, False], ids=["existing-rank", "new-rank"])
