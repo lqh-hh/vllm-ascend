@@ -1,5 +1,5 @@
-from typing import TYPE_CHECKING
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
