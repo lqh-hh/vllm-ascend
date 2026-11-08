@@ -131,7 +131,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         and a dummy-batch runnability check on top.
         """
         self._validate_scale_down_preconditions()
-        super().scale_down(ft_request)
+        num_redundant_experts = super().scale_down(ft_request)
 
         # Verify the redistributed model is runnable before reporting healthy.
         parallel_config = self.worker.parallel_config
@@ -144,6 +144,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         self.activate_cpu_group_timeouts(ft_request)
         torch.npu.synchronize()
         logger.info("[FT] Ascend scale_down validation complete; worker is ready for the engine recovery vote.")
+        return num_redundant_experts
 
     def _validate_scale_down_preconditions(self) -> None:
         if not self.worker.use_v2_model_runner:
@@ -174,7 +175,7 @@ class WorkerSentinel(GPUWorkerSentinel):
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
             )
 
-    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> None:
+    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> int:
         """Redistribute experts onto the surviving slots after scale-down.
 
         Overrides the upstream flow so reassigned weights reload through the
@@ -209,6 +210,10 @@ class WorkerSentinel(GPUWorkerSentinel):
 
         for model, model_state, model_path in models:
             self._redistribute_model(model, model_state, model_path, dead_ep_ranks)
+        main_state = models[0][1]
+        return (
+            int((main_state.physical_to_logical_map[0] >= 0).sum().item()) - main_state.logical_replica_count.shape[1]
+        )
 
     def _redistribute_model(
         self,

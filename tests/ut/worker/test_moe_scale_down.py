@@ -29,7 +29,10 @@ def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
         model=SimpleNamespace(moe_layers=[layer]),
     )
     sentinel = object.__new__(WorkerSentinel)
-    sentinel.worker = SimpleNamespace(model_runner=SimpleNamespace(model=state.model))
+    sentinel.worker = SimpleNamespace(
+        model_runner=SimpleNamespace(model=state.model),
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(model="unused-checkpoint")),
+    )
     sentinel._eplb_model_state = lambda: state
     manager = SimpleNamespace(
         uses_mega_moe=mega_moe,
