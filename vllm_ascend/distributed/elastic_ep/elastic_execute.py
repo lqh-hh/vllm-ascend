@@ -151,9 +151,8 @@ def ascend_batch_transfer_weights(
         tcp_store_group.send_obj(all_params_name, dst=peer_rank)
 
     if len(all_params_name) != len(peer_rank_all_params_name):
-        common = list(set(all_params_name) & set(peer_rank_all_params_name))
-        ids = [all_params_name.index(name) for name in common]
-        all_params = [param for idx, param in enumerate(all_params) if idx in ids]
+        peer_names = set(peer_rank_all_params_name)
+        all_params = [param for name, param in zip(all_params_name, all_params) if name in peer_names]
 
     assert len(all_params) > 0
     transfer_stream = stream or torch.npu.current_stream()
