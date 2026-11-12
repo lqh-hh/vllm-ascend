@@ -10,8 +10,8 @@ from vllm_ascend.distributed.elastic_ep.mega_moe_capture import MegaMoeCaptureSt
 
 
 def make_capture_state(rank_map=None):
-    buffer = FakeSymmBuffer()
-    buffer.num_experts = 16
+    buffer = FakeSymmBuffer(len(rank_map) if rank_map is not None else 4)
+    buffer.num_experts = 4 * buffer.ep_world_size
     buffer.context = torch.zeros(8, dtype=torch.int32)
     buffer.clean_mask_buffer()
     buffer.rank_id = 0

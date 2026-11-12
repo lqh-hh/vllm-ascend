@@ -193,15 +193,14 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         return bool(
             request.operation_id
             and parallel.enable_fault_tolerance
-            and parallel.tensor_parallel_size
-            == parallel.pipeline_parallel_size
-            == parallel.prefill_context_parallel_size
-            == 1
+            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size == 1
             and config.lora_config is None
             and getattr(config, "speculative_config", None) is None
             and comm.mega_moe_quant_type in (QuantType.NONE, QuantType.W8A8)
             and upstream_elastic_execute.get_active_dp_size(dp_group) < request.new_data_parallel_size
-            and request.new_data_parallel_size == state.buffer.ep_world_size == get_mc2_group().world_size
+            and request.new_data_parallel_size * parallel.tensor_parallel_size
+            == state.buffer.ep_world_size
+            == get_mc2_group().world_size
             and bool(getattr(dp_group, "dead_dp_ranks", ()))
             and callable(getattr(state.buffer, "update_group", None))
         )
@@ -255,14 +254,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def _synchronize_capture_mapping_setup(self, reconfig_request: ReconfigureDistributedRequest) -> None:
         """Wait for every target rank before initializing target MC2 communication."""
-        # Fast restore requires TP=PP=PCP=1 and preserves DP identities.
+        # Every TP Worker must finish mapping setup before target MC2 creation.
         # Old ranks arrive after draining; new ranks arrive after mapping setup.
         operation_id = reconfig_request.operation_id
-        rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+        parallel = self.worker.vllm_config.parallel_config
+        rank = parallel.data_parallel_rank * parallel.world_size + self.worker.rank
         store = self._capture_store(reconfig_request)
         ready_keys = [
             self._capture_key(operation_id, f"mapping/ready/{rank}")
-            for rank in range(reconfig_request.new_data_parallel_size)
+            for rank in range(reconfig_request.new_data_parallel_size * parallel.world_size)
         ]
         store.set(self._capture_key(operation_id, f"mapping/ready/{rank}"), b"1")
         store.wait(ready_keys)

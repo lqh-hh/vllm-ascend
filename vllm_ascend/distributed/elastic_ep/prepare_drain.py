@@ -114,9 +114,11 @@ class AscendPrepareDrain:
                 if entered == int(tensor[0].item()) and completed <= entered:
                     snapshots.append((entered, completed))
                     break
-        if not snapshots or any(snapshot != snapshots[0] for snapshot in snapshots[1:]):
-            raise RuntimeError(f"Local Workers have inconsistent DP collective progress: {snapshots}")
-        return snapshots[0]
+        if not snapshots:
+            raise RuntimeError("No Worker DP collective progress is available")
+        # TP Workers publish independently. Wait for the slowest completion,
+        # while every DP replica catches up to the furthest entered epoch.
+        return max(entered for entered, _ in snapshots), min(completed for _, completed in snapshots)
 
     def poll_pending_batch(self, future: Future[Any]) -> bool:
         if self._result_future is None:

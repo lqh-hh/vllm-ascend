@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
 from vllm_ascend.distributed.elastic_ep.dp_collective import (
     WorkerDPCollectiveState,
     install_dp_collective_tracking,
+    needs_worker_progress,
     open_worker_state,
     track_dp_collectives,
 )
@@ -187,6 +188,18 @@ def test_worker_progress_storage_is_shared_without_executor_tensor_serialization
     assert observer.tolist() == [7, 7]
 
 
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_fast_restore_tracks_each_tp_worker(tp_size):
+    parallel = SimpleNamespace(
+        enable_elastic_ep=True,
+        enable_fault_tolerance=True,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    assert needs_worker_progress(SimpleNamespace(parallel_config=parallel, use_v2_model_runner=True))
+
+
 def test_serving_collective_aligns_joiner_epoch_and_preserves_failed_progress(monkeypatch):
     from vllm_ascend.distributed.elastic_ep import dp_collective
 
@@ -329,4 +342,24 @@ def test_catch_up_dummy_wait_does_not_block_or_submit_twice(drain_state, monkeyp
     progress.fill_(6)
     assert drain.progress()
     state.engine_core.model_executor.execute_dummy_batch.assert_called_once()
+    state._collective_rpc.assert_called_once()
+
+
+def test_drain_waits_for_every_tp_worker_before_context_update(drain_state, monkeypatch):
+    drain, state, progress = drain_state
+    sibling = torch.tensor([6, 5], dtype=torch.int64)
+    state.engine_core._ascend_dp_collective_states.append(sibling)
+
+    def gather(outputs, local, **kwargs):
+        outputs[0].copy_(local)
+        outputs[1].copy_(torch.tensor([6, 6, 0]))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+    drain.begin()
+    assert not drain.progress()
+    assert not drain._catch_up
+    state._collective_rpc.assert_not_called()
+    progress.fill_(6)
+    sibling.fill_(6)
+    assert drain.progress()
     state._collective_rpc.assert_called_once()

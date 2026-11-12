@@ -29,6 +29,7 @@ def _executor_and_worker():
         prefill_context_parallel_size=1,
     )
     worker = SimpleNamespace(
+        rank=0,
         vllm_config=SimpleNamespace(
             parallel_config=parallel_config,
             lora_config=None,
@@ -94,6 +95,7 @@ def _capture_mapping_executor(monkeypatch, width, dead_ranks):
         (8, {1, 3}, [0, 1, 0, 1, 4, 5, 4, 5]),
         (8, {0}, [2, 3, 2, 3, 4, 5, 6, 7]),
         (8, {0, 2, 3}, [2, 3, 2, 3, 2, 3, 2, 3]),
+        (16, {1}, [0, 1, 2, 3, 0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15]),
     ],
 )
 def test_capture_broadcast_preserves_survivors_and_serving_mapping(monkeypatch, width, dead_ranks, expected):
@@ -225,14 +227,14 @@ def test_target_ep_is_ready_before_new_rank_moe_setup(monkeypatch):
     assert materialized == {"EP"}
 
 
-def _mega_restore_executor(monkeypatch, dead_ranks=(2,), quant_type=QuantType.W8A8):
+def _mega_restore_executor(monkeypatch, dead_ranks=(2,), quant_type=QuantType.W8A8, tp_size=1):
     executor, worker = _executor_and_worker()
     parallel = worker.vllm_config.parallel_config
-    parallel.world_size = 1
+    parallel.world_size = parallel.tensor_parallel_size = tp_size
     parallel.data_parallel_size = 4
     parallel.enable_fault_tolerance = True
     comm = SimpleNamespace(
-        mega_moe_capture_state=make_capture_state(),
+        mega_moe_capture_state=make_capture_state(list(range(4 * tp_size))),
         mega_moe_quant_type=quant_type,
         token_dispatcher=SimpleNamespace(refresh_hccl_group=MagicMock()),
     )
@@ -243,13 +245,16 @@ def _mega_restore_executor(monkeypatch, dead_ranks=(2,), quant_type=QuantType.W8
     monkeypatch.setattr(f"{module}.is_moe_layer", lambda candidate: candidate is moe)
     monkeypatch.setattr(f"{module}.get_moe_comm_method", lambda kind, config: comm if config is moe_config else None)
     monkeypatch.setattr(f"{module}.get_dp_group", lambda: SimpleNamespace(world_size=4, dead_dp_ranks=set(dead_ranks)))
-    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]))
+    monkeypatch.setattr(
+        f"{module}.get_mc2_group", lambda: SimpleNamespace(world_size=4 * tp_size, ranks=list(range(4 * tp_size)))
+    )
     return executor, worker, comm
 
 
 @pytest.mark.parametrize("quant_type", [QuantType.NONE, QuantType.W8A8, QuantType.W4A8])
-def test_mega_middle_restore_exchanges_capture_decision(monkeypatch, quant_type):
-    executor, _, _ = _mega_restore_executor(monkeypatch, quant_type=quant_type)
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_mega_middle_restore_exchanges_capture_decision(monkeypatch, quant_type, tp_size):
+    executor, _, _ = _mega_restore_executor(monkeypatch, quant_type=quant_type, tp_size=tp_size)
     values = {}
     store = SimpleNamespace(set=values.__setitem__, get=values.__getitem__)
     monkeypatch.setattr(executor, "_capture_store", lambda request: store)
@@ -265,22 +270,26 @@ def test_mega_middle_restore_exchanges_capture_decision(monkeypatch, quant_type)
 
 
 @pytest.mark.parametrize("last_rank", [0, 1], ids=["late-survivor", "late-joiner"])
-def test_mapping_rendezvous_waits_for_all_ranks_in_current_operation(monkeypatch, last_rank):
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_mapping_rendezvous_waits_for_all_ranks_in_current_operation(monkeypatch, last_rank, tp_size):
+    last_rank = last_rank * tp_size + tp_size - 1
     store = torch.distributed.HashStore()
     store.set_timeout(timedelta(seconds=5))
     key = AscendElasticEPScalingExecutor._capture_key
-    for rank in range(4):
+    for rank in range(4 * tp_size):
         store.set(key("previous", f"mapping/ready/{rank}"), b"1")
     request = SimpleNamespace(operation_id="current", new_data_parallel_size=4)
     monkeypatch.setattr(AscendElasticEPScalingExecutor, "_capture_store", staticmethod(lambda _: store))
 
     def arrive(rank):
         executor, worker = _executor_and_worker()
-        worker.vllm_config.parallel_config.data_parallel_rank = rank
+        worker.rank = rank % tp_size
+        worker.vllm_config.parallel_config.world_size = tp_size
+        worker.vllm_config.parallel_config.data_parallel_rank = rank // tp_size
         executor._synchronize_capture_mapping_setup(request)
 
-    early_ranks = [rank for rank in range(4) if rank != last_rank]
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    early_ranks = [rank for rank in range(4 * tp_size) if rank != last_rank]
+    with ThreadPoolExecutor(max_workers=len(early_ranks)) as pool:
         futures = [pool.submit(arrive, rank) for rank in early_ranks]
         store.wait([key("current", f"mapping/ready/{rank}") for rank in early_ranks])
         assert all(not future.done() for future in futures)

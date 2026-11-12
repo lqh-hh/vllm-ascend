@@ -20,10 +20,7 @@ def needs_worker_progress(config) -> bool:
         parallel.enable_elastic_ep
         and parallel.enable_fault_tolerance
         and config.use_v2_model_runner
-        and parallel.tensor_parallel_size
-        == parallel.pipeline_parallel_size
-        == parallel.prefill_context_parallel_size
-        == 1
+        and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size == 1
     )
 
 
