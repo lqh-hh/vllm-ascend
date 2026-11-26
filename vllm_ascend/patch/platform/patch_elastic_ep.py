@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-"""Track Worker progress and coordinate Ascend Elastic EP prepare drains."""
+"""Adapt Ascend Elastic EP preparation and fault recovery."""
 
 from functools import wraps
+from importlib.util import find_spec
 
 import torch
 from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
@@ -26,6 +27,40 @@ _original_has_global_unfinished_reqs = DPEngineCoreProc._has_global_unfinished_r
 _original_eep_commit_pause_mode = DPAsyncMPClient._eep_commit_pause_mode
 _original_scaling_state_init = ElasticEPScalingState.__init__
 logger = init_logger(__name__)
+
+
+def _patch_frontend_scale_up_validation() -> None:
+    if find_spec("vllm.v1.fault_tolerance.frontend_sentinel") is None:
+        return
+
+    from vllm.v1.fault_tolerance.frontend_sentinel import FrontendSentinel
+
+    original_validate_scale_up = FrontendSentinel.validate_scale_up
+
+    @wraps(original_validate_scale_up)
+    def _validate_scale_up(self: FrontendSentinel, new_data_parallel_size: int) -> None:
+        parallel = self.client.vllm_config.parallel_config
+        current_size = parallel.data_parallel_size
+        if not (
+            parallel.enable_elastic_ep
+            and parallel.enable_fault_tolerance
+            and parallel.data_parallel_external_lb
+            # Ascend uses flashinfer_all2allv to disable SP MoE with FlashComm1 off.
+            and parallel.all2all_backend in ("allgather_reducescatter", "flashinfer_all2allv")
+            and current_size < new_data_parallel_size
+            and current_size < self.baseline_dp_size
+        ):
+            original_validate_scale_up(self, new_data_parallel_size)
+            return
+
+        # Ascend uses MC2/MegaMoe under the default all-to-all setting.
+        if new_data_parallel_size < self.baseline_dp_size:
+            raise ValueError(
+                "Partial scale-up after fault recovery is not supported; "
+                f"restore at least {self.baseline_dp_size} DP ranks."
+            )
+
+    FrontendSentinel.validate_scale_up = _validate_scale_up
 
 
 @wraps(_original_scaling_state_init)
@@ -155,4 +190,5 @@ EngineCore.step_with_batch_queue = _step_with_batch_queue
 EngineCore.execute_dummy_batch = _execute_dummy_batch
 DPEngineCoreProc._has_global_unfinished_reqs = _has_global_unfinished_reqs
 DPAsyncMPClient._eep_commit_pause_mode = _eep_commit_pause_mode
+_patch_frontend_scale_up_validation()
 install_dp_collective_tracking()

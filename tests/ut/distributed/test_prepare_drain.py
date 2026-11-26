@@ -25,6 +25,25 @@ from vllm_ascend.distributed.elastic_ep.dp_collective import (
 from vllm_ascend.distributed.elastic_ep.prepare_drain import AscendPrepareDrain
 
 
+def test_ascend_fault_restore_requires_full_refill():
+    frontend = pytest.importorskip("vllm.v1.fault_tolerance.frontend_sentinel")
+    from vllm_ascend.patch.platform import patch_elastic_ep  # noqa: F401
+
+    parallel = SimpleNamespace(
+        all2all_backend="flashinfer_all2allv",
+        data_parallel_external_lb=True,
+        data_parallel_size=4,
+        enable_elastic_ep=True,
+        enable_fault_tolerance=True,
+    )
+    sentinel = frontend.FrontendSentinel(SimpleNamespace(vllm_config=SimpleNamespace(parallel_config=parallel)))
+    parallel.data_parallel_size = 2
+
+    sentinel.validate_scale_up(4)
+    with pytest.raises(ValueError, match="restore at least 4 DP ranks"):
+        sentinel.validate_scale_up(3)
+
+
 @pytest.mark.parametrize("phase", ["restore", "fallback", "missing", "scale-down", "unprepared", "internal"])
 def test_commit_keeps_requests_only_for_prepared_mega_restore(monkeypatch, phase):
     from vllm_ascend.distributed.elastic_ep.elastic_execute import AscendElasticEPScalingExecutor

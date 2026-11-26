@@ -29,12 +29,15 @@
 # What's Patched and how it works:
 # --------------------------------
 # * platform/patch_elastic_ep.py:
-#   Target: ElasticEPScalingState.__init__, DPAsyncMPClient._eep_commit_pause_mode.
+#   Target: ElasticEPScalingState.__init__, DPAsyncMPClient._eep_commit_pause_mode,
+#           FrontendSentinel.validate_scale_up.
 #   Why: MegaMoe restore needs a common Worker boundary and preserves serving graphs.
-#   How: Attach the Ascend prepare controller and select keep for local capture;
-#        retain upstream pause selection for other operations.
-#   Related PR: No upstream hooks for prepare controllers or commit pause selection.
-#   Future plan: Use upstream preparation and pause hooks when available.
+#        The vLLM frontend currently requires NIXL EP to refill faulted ranks.
+#   How: Attach the Ascend prepare controller, select keep for local capture,
+#        and allow full refills for the default Ascend communication backend.
+#   Related PR: No upstream hooks for prepare, commit pause, or refill validation.
+#   Future plan: Use upstream hooks when available and remove the refill override
+#                once the frontend validates backend capabilities.
 # --------------------------------
 # * worker/patch_kda_recoverssm.py:
 #   Target: Kimi KDA's KDARecoverSSMCommitContext module binding.
